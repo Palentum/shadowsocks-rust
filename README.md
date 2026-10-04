@@ -1071,7 +1071,7 @@ The configuration file is set by `http_auth_config_path` in `locals`.
 
 ### JLS Transport
 
-[JLS](https://github.com/JimmyHuang454/JLS) disguises the TCP connection as a TLS 1.3 connection to a real website without any certificate. The client hides an authentication token in the TLS `ClientHello`; connections that fail authentication (active probes, ordinary TLS clients) are forwarded byte-for-byte to the real website `dest`. The shadowsocks stream runs inside the TLS session, UDP is not affected.
+[JLS](https://github.com/JimmyHuang454/JLS) disguises the TCP connection as a TLS 1.3 connection to a real website without any certificate. The client hides an authentication token in the TLS `ClientHello`; connections that fail authentication (ordinary TLS clients, active probes, replays of recently seen `ClientHello`s) are forwarded byte-for-byte to the real website `dest`. The shadowsocks stream runs inside the TLS session, UDP is not affected.
 
 It is built in with feature `jls` and configured with the plugin fields, no plugin process will be started. `plugin_opts` is a `;` separated `key=value` list.
 
@@ -1123,6 +1123,7 @@ Limitations:
 - Only TCP is carried by JLS, UDP is relayed as plain shadowsocks UDP.
 - One JLS user per server.
 - Fallback connections are connected to `dest` directly, without rate limit or loop detection.
+- Replay protection is limited: the authentication token has no timestamp, so each server only remembers the latest 100,000 to 200,000 authenticated `ClientHello`s in memory. A `ClientHello` replayed after that, or after a restart, passes authentication, and the server's handshake reveals that it is not `dest`.
 - The `ClientHello` has rustls' fingerprint. mihomo's `client-fingerprint: random` may trigger `HelloRetryRequest`, which is unsupported.
 - Use long random `username` and `password`, they protect the authentication token against offline brute-force.
 

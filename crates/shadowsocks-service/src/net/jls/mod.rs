@@ -348,4 +348,62 @@ mod test {
         };
         assert_eq!(received, [0x16, 0x03, 0x01]);
     }
+
+    /// Capture the ClientHello record of a genuine client
+    async fn capture_client_hello() -> Vec<u8> {
+        let opts = JlsClientOptions::parse("host=www.example.com;username=jls-user;password=jls-password").unwrap();
+        let (client, mut server) = duplex(64 * 1024);
+        let client = tokio::spawn(async move { client::connect(&opts, client).await });
+
+        let mut client_hello = vec![0u8; 5];
+        server.read_exact(&mut client_hello).await.unwrap();
+        let len = u16::from_be_bytes([client_hello[3], client_hello[4]]) as usize;
+        client_hello.resize(5 + len, 0);
+        server.read_exact(&mut client_hello[5..]).await.unwrap();
+
+        drop(server);
+        assert!(client.await.unwrap().is_err());
+        client_hello
+    }
+
+    #[tokio::test]
+    async fn replayed_client_hello_falls_back() {
+        let client_hello = capture_client_hello().await;
+        let acceptor = acceptor();
+
+        // First seen, authenticated but the handshake can't be completed without the client
+        let (mut client, server) = duplex(64 * 1024);
+        client.write_all(&client_hello).await.unwrap();
+        let accepted = acceptor.accept(server, Some(Duration::from_millis(100))).await;
+        assert!(matches!(accepted, Err(ref err) if err.kind() == ErrorKind::TimedOut));
+        let mut buf = [0u8; 1];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf[0], 0x16);
+
+        // The same ClientHello re-fragmented into small records
+        let mut fragmented = Vec::new();
+        for chunk in client_hello[5..].chunks(16) {
+            fragmented.extend_from_slice(&client_hello[..3]);
+            fragmented.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+            fragmented.extend_from_slice(chunk);
+        }
+
+        for replay in [client_hello, fragmented] {
+            let (mut client, server) = duplex(64 * 1024);
+            client.write_all(&replay).await.unwrap();
+            let Ok(JlsAccepted::Fallback(_server, received)) =
+                acceptor.accept(server, Some(Duration::from_secs(1))).await
+            else {
+                panic!("expecting fallback");
+            };
+            assert_eq!(received, replay);
+
+            // Nothing should be written to the client
+            assert!(
+                time::timeout(Duration::from_millis(100), client.read(&mut buf))
+                    .await
+                    .is_err()
+            );
+        }
+    }
 }

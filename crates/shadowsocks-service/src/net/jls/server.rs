@@ -1,7 +1,9 @@
 //! JLS server handshake and fallback forwarding
 
 use std::{
+    collections::HashSet,
     io::{self, ErrorKind},
+    mem,
     sync::Arc,
     time::Duration,
 };
@@ -32,6 +34,9 @@ use super::{CRYPTO_PROVIDER, options::JlsServerOptions, stream::JlsStream};
 /// A ClientHello larger than this is not from our clients.
 const MAX_CLIENT_HELLO_SIZE: usize = 64 * 1024;
 
+/// Authenticated ClientHellos remembered by each generation of [`ReplayFilter`]
+const REPLAY_FILTER_CAPACITY: usize = 100_000;
+
 /// Result of [`JlsAcceptor::accept`]
 pub enum JlsAccepted<S> {
     /// Client passed JLS authentication, handshake completed
@@ -45,6 +50,7 @@ pub enum JlsAccepted<S> {
 pub struct JlsAcceptor {
     config: Arc<ServerConfig>,
     dest: Address,
+    replay: spin::Mutex<ReplayFilter>,
 }
 
 impl JlsAcceptor {
@@ -82,6 +88,7 @@ impl JlsAcceptor {
         Ok(Self {
             config: Arc::new(config),
             dest: opts.dest,
+            replay: spin::Mutex::default(),
         })
     }
 
@@ -92,8 +99,8 @@ impl JlsAcceptor {
 
     /// Accept a JLS connection on `stream`
     ///
-    /// Anything that fails authentication before the server's first flight, including a `timeout`,
-    /// becomes [`JlsAccepted::Fallback`]. Errors after authentication are returned as `Err`.
+    /// Anything that fails authentication before the server's first flight, including a `timeout`
+    /// and a replayed ClientHello, becomes [`JlsAccepted::Fallback`]. Errors after authentication are returned as `Err`.
     pub async fn accept<S>(&self, mut stream: S, timeout: Option<Duration>) -> io::Result<JlsAccepted<S>>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -127,7 +134,15 @@ impl JlsAcceptor {
             }
 
             match conn.jls_state() {
-                JlsState::AuthSuccess(..) => break,
+                JlsState::AuthSuccess(..) => {
+                    // A replayed ClientHello passes authentication too, fall back before the ServerHello reveals us
+                    let fresh = client_hello_random(&received).is_some_and(|random| self.replay.lock().insert(random));
+                    if !fresh {
+                        trace!("jls fallback, replayed client hello");
+                        return Ok(JlsAccepted::Fallback(stream, received));
+                    }
+                    break;
+                }
                 JlsState::NotAuthed => continue,
                 state => {
                     trace!("jls fallback, {state:?}");
@@ -181,4 +196,68 @@ fn feed(conn: &mut ServerConnection, mut data: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Get the random of the ClientHello in TLS `records`, which is JLS' authentication token
+fn client_hello_random(mut records: &[u8]) -> Option<[u8; 32]> {
+    // Handshake message type (1), length (3) and legacy_version (2) precede the random
+    let mut prefix = [0u8; 38];
+    let mut filled = 0;
+    while filled < prefix.len() {
+        let len = u16::from_be_bytes([*records.get(3)?, *records.get(4)?]) as usize;
+        let fragment = records.get(5..5 + len)?;
+        // rustls ignores warning alerts before the ClientHello
+        if records[0] == 0x16 {
+            let n = fragment.len().min(prefix.len() - filled);
+            prefix[filled..filled + n].copy_from_slice(&fragment[..n]);
+            filled += n;
+        }
+        records = &records[5 + len..];
+    }
+    prefix[6..].try_into().ok()
+}
+
+/// Randoms of authenticated ClientHellos
+///
+/// They have no timestamp, so only the latest `REPLAY_FILTER_CAPACITY` to `2 * REPLAY_FILTER_CAPACITY` are remembered.
+#[derive(Default)]
+struct ReplayFilter {
+    current: HashSet<[u8; 32]>,
+    previous: HashSet<[u8; 32]>,
+}
+
+impl ReplayFilter {
+    /// Remember `random`, returns `false` if it has been seen
+    fn insert(&mut self, random: [u8; 32]) -> bool {
+        if self.previous.contains(&random) || !self.current.insert(random) {
+            return false;
+        }
+        if self.current.len() >= REPLAY_FILTER_CAPACITY {
+            self.previous = mem::take(&mut self.current);
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn replay_filter_remembers_two_generations() {
+        let random = |i: usize| {
+            let mut r = [0u8; 32];
+            r[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            r
+        };
+
+        let mut filter = ReplayFilter::default();
+        for i in 0..2 * REPLAY_FILTER_CAPACITY {
+            assert!(filter.insert(random(i)));
+        }
+        assert!(!filter.insert(random(REPLAY_FILTER_CAPACITY)));
+        assert!(!filter.insert(random(2 * REPLAY_FILTER_CAPACITY - 1)));
+        // The first generation has been forgotten
+        assert!(filter.insert(random(0)));
+    }
 }
