@@ -660,6 +660,13 @@ impl AccessControl {
         }
     }
 
+    /// Check if outbound host name is blocked by the domain name rules of `[outbound_block_list]` (for server)
+    ///
+    /// The host is neither resolved nor checked against `[outbound_allow_list]`
+    pub fn check_outbound_host_blocked(&self, host: &str) -> bool {
+        self.outbound_block.check_host_matched(&Self::convert_to_ascii(host))
+    }
+
     fn check_outbound_ip_blocked(&self, ip: &IpAddr) -> bool {
         if self.outbound_block.check_ip_matched(ip) {
             // If IP is in outbound_block, it should be blocked

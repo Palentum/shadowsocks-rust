@@ -13,7 +13,7 @@ use shadowsocks::{
 use crate::config::OutboundProxy;
 use crate::{
     acl::AccessControl,
-    config::SecurityConfig,
+    config::{DomainSniffConfig, SecurityConfig},
     net::{FlowStat, OutboundProxyClient},
 };
 
@@ -31,6 +31,9 @@ pub struct ServiceContext {
 
     // Outbound proxy chain (resolved into a reusable client)
     outbound_client: Option<Arc<OutboundProxyClient>>,
+
+    // Domain sniffing of TCP requests to IP addresses
+    domain_sniff: DomainSniffConfig,
 }
 
 impl Default for ServiceContext {
@@ -41,6 +44,7 @@ impl Default for ServiceContext {
             acl: None,
             flow_stat: Arc::new(FlowStat::new()),
             outbound_client: None,
+            domain_sniff: DomainSniffConfig::default(),
         }
     }
 }
@@ -124,6 +128,14 @@ impl ServiceContext {
         }
     }
 
+    /// Check if outbound host name is blocked by domain name rules, without resolving it
+    pub fn check_outbound_host_blocked(&self, host: &str) -> bool {
+        match self.acl {
+            None => false,
+            Some(ref acl) => acl.check_outbound_host_blocked(host),
+        }
+    }
+
     /// Check if client should be blocked
     pub fn check_client_blocked(&self, addr: &SocketAddr) -> bool {
         match self.acl {
@@ -142,5 +154,15 @@ impl ServiceContext {
     pub fn set_security_config(&mut self, security: &SecurityConfig) {
         let context = Arc::get_mut(&mut self.context).expect("cannot set security on a shared context");
         context.set_replay_attack_policy(security.replay_attack.policy);
+    }
+
+    /// Set domain sniffing of TCP requests to IP addresses
+    pub fn set_domain_sniff(&mut self, domain_sniff: DomainSniffConfig) {
+        self.domain_sniff = domain_sniff;
+    }
+
+    /// Get domain sniffing of TCP requests to IP addresses
+    pub fn domain_sniff(&self) -> DomainSniffConfig {
+        self.domain_sniff
     }
 }

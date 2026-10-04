@@ -27,7 +27,7 @@ use tokio::{
 use crate::net::jls::{JlsAccepted, JlsAcceptor, is_jls_plugin};
 use crate::net::{MonProxyStream, OutboundProxyStream, TcpDialer, jls::MaybeJlsStream, utils::ignore_until_end};
 
-use super::context::ServiceContext;
+use super::{context::ServiceContext, sniff::sniff_domain};
 
 /// `TcpDialer` adapter that uses the server's connect-options.
 struct ServerTcpDialer<'a> {
@@ -274,7 +274,7 @@ struct TcpServerClient {
 impl TcpServerClient {
     async fn serve(mut self) -> io::Result<()> {
         // let target_addr = match Address::read_from(&mut self.stream).await {
-        let target_addr = match timeout_fut(self.timeout, self.stream.handshake()).await {
+        let mut target_addr = match timeout_fut(self.timeout, self.stream.handshake()).await {
             Ok(a) => a,
             // Err(Socks5Error::IoError(ref err)) if err.kind() == ErrorKind::UnexpectedEof => {
             //     debug!(
@@ -341,6 +341,30 @@ impl TcpServerClient {
             self.peer_addr, target_addr
         );
 
+        // Bytes read ahead by sniffing, sent to the target first
+        let mut first_packet = None;
+        let domain_sniff = self.context.domain_sniff();
+        if domain_sniff.is_enabled() && matches!(target_addr, Address::SocketAddress(..)) {
+            let (packet, domain) = sniff_domain(&mut self.stream, domain_sniff).await?;
+            if let Some(domain) = domain {
+                if domain_sniff.redirect {
+                    debug!(
+                        "tcp client {} sniffed {} for {}, redirecting",
+                        self.peer_addr, domain, target_addr
+                    );
+                    target_addr = Address::DomainNameAddress(domain, target_addr.port());
+                } else if self.context.check_outbound_host_blocked(&domain) {
+                    // The sniffed domain name is not what we connect to, it can only block
+                    error!(
+                        "tcp client {} outbound {} (sniffed {}) blocked by ACL rules",
+                        self.peer_addr, target_addr, domain
+                    );
+                    return Ok(());
+                }
+            }
+            first_packet = Some(packet);
+        }
+
         if self.context.check_outbound_blocked(&target_addr).await {
             error!(
                 "tcp client {} outbound {} blocked by ACL rules",
@@ -386,7 +410,14 @@ impl TcpServerClient {
         // Protocols like FTP, clients will wait for servers to send Welcome Message without sending anything.
         //
         // Wait at most 500ms, and then sends handshake packet to remote servers.
-        if self.context.connect_opts_ref().tcp.fastopen {
+        if let Some(packet) = first_packet {
+            // Sniffing has already waited for the first packet
+            if !packet.is_empty() {
+                timeout_fut(self.timeout, remote_stream.write_all(&packet)).await?;
+            } else if self.context.connect_opts_ref().tcp.fastopen {
+                timeout_fut(self.timeout, remote_stream.write(&[])).await?;
+            }
+        } else if self.context.connect_opts_ref().tcp.fastopen {
             let mut buffer = [0u8; 8192];
             match time::timeout(Duration::from_millis(500), self.stream.read(&mut buffer)).await {
                 Ok(Ok(0)) => {

@@ -148,6 +148,8 @@ pub fn define_command_line_options(mut app: Command) -> Command {
         )
         .arg(Arg::new("MANAGER_ADDR").long("manager-addr").num_args(1).action(ArgAction::Set).value_parser(vparser::parse_manager_addr).alias("manager-address").help("ShadowSocks Manager (ssmgr) address, could be \"IP:Port\", \"Domain:Port\" or \"/path/to/unix.sock\""))
         .arg(Arg::new("ACL").long("acl").num_args(1).action(ArgAction::Set).value_hint(ValueHint::FilePath).help("Path to ACL (Access Control List)"))
+        .arg(Arg::new("DOMAIN_SNIFF").long("domain-sniff").num_args(1).action(ArgAction::Append).value_delimiter(',').value_parser(PossibleValuesParser::new(["tls", "http"])).help("Sniff the domain name of TCP requests to IP addresses from TLS SNI or HTTP Host, e.g. \"tls,http\""))
+        .arg(Arg::new("SNIFF_REDIRECT").long("sniff-redirect").action(ArgAction::SetTrue).help("Connect to the sniffed domain name instead of the requested IP address"))
         .arg(Arg::new("DNS").long("dns").num_args(1).action(ArgAction::Set).help("DNS nameservers, formatted like [(tcp|udp)://]host[:port][,host[:port]]..., or unix:///path/to/dns, or predefined keys like \"google\", \"cloudflare\""))
         .arg(Arg::new("DNS_CACHE_SIZE").long("dns-cache-size").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(usize)).help("DNS cache size in number of records. Works when trust-dns DNS backend is enabled."))
         .arg(Arg::new("TCP_NO_DELAY").long("tcp-no-delay").alias("no-delay").action(ArgAction::SetTrue).help("Set TCP_NODELAY option for sockets"))
@@ -461,6 +463,19 @@ pub fn create(matches: &ArgMatches) -> ShadowsocksResult<(Runtime, impl Future<O
             let acl = AccessControl::load_from_file(acl_file)
                 .map_err(|err| ShadowsocksError::LoadAclFailure(format!("loading ACL \"{acl_file}\", {err}")))?;
             config.acl = Some(acl);
+        }
+
+        if let Some(protocols) = matches.get_many::<String>("DOMAIN_SNIFF") {
+            config.domain_sniff.tls = false;
+            config.domain_sniff.http = false;
+            for protocol in protocols {
+                // Already validated by PossibleValuesParser
+                config.domain_sniff.enable(protocol);
+            }
+        }
+
+        if matches.get_flag("SNIFF_REDIRECT") {
+            config.domain_sniff.redirect = true;
         }
 
         if let Some(dns) = matches.get_one::<String>("DNS") {

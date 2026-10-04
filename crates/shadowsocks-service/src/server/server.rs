@@ -15,7 +15,7 @@ use tokio::time;
 
 use crate::{
     acl::AccessControl,
-    config::{OutboundProxy, SecurityConfig},
+    config::{DomainSniffConfig, OutboundProxy, SecurityConfig},
     net::{FlowStat, jls::is_jls_plugin},
     utils::ServerHandle,
 };
@@ -113,6 +113,11 @@ impl ServerBuilder {
     /// Set outbound SOCKS5 proxy chain
     pub fn set_outbound_proxies(&mut self, proxies: Vec<OutboundProxy>) {
         self.context.set_outbound_proxies(proxies);
+    }
+
+    /// Set domain sniffing of TCP requests to IP addresses
+    pub fn set_domain_sniff(&mut self, domain_sniff: DomainSniffConfig) {
+        self.context.set_domain_sniff(domain_sniff);
     }
 
     /// Start the server

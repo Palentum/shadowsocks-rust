@@ -398,6 +398,11 @@ struct SSConfig {
     outbound_proxy: Option<SSOutboundProxyConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    domain_sniff: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sniff_redirect: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     security: Option<SSSecurityConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1416,6 +1421,34 @@ pub struct SecurityReplayAttackConfig {
     pub policy: ReplayAttackPolicy,
 }
 
+/// Domain sniffing of the server's TCP requests to IP addresses
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DomainSniffConfig {
+    /// Sniffs the SNI of TLS ClientHello
+    pub tls: bool,
+    /// Sniffs the `Host` header of HTTP/1.x requests
+    pub http: bool,
+    /// Connects to the sniffed domain name instead of the requested IP address
+    pub redirect: bool,
+}
+
+impl DomainSniffConfig {
+    /// Sniffs `protocol`, which is `"tls"` or `"http"`. Returns `false` if `protocol` is not supported
+    pub fn enable(&mut self, protocol: &str) -> bool {
+        match protocol {
+            "tls" => self.tls = true,
+            "http" => self.http = true,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Check if any protocol is sniffed
+    pub fn is_enabled(&self) -> bool {
+        self.tls || self.http
+    }
+}
+
 /// Balancer Config
 #[derive(Clone, Debug, Default)]
 pub struct BalancerConfig {
@@ -1605,6 +1638,9 @@ pub struct Config {
     /// Replay attack policy
     pub security: SecurityConfig,
 
+    /// Domain sniffing of server's TCP requests to IP addresses
+    pub domain_sniff: DomainSniffConfig,
+
     /// Balancer config of local server
     pub balancer: BalancerConfig,
 
@@ -1735,6 +1771,8 @@ impl Config {
             local_stat_addr: None,
 
             security: SecurityConfig::default(),
+
+            domain_sniff: DomainSniffConfig::default(),
 
             balancer: BalancerConfig::default(),
 
@@ -2620,6 +2658,25 @@ impl Config {
                 .map_err(|e| Error::new(ErrorKind::Invalid, "invalid outbound_proxy", Some(e)))?;
         }
 
+        if let Some(protocols) = config.domain_sniff {
+            for protocol in protocols {
+                if !nconfig.domain_sniff.enable(&protocol) {
+                    let err = Error::new(
+                        ErrorKind::Invalid,
+                        "invalid domain_sniff",
+                        Some(format!(
+                            "unsupported protocol \"{protocol}\", expecting \"tls\" or \"http\""
+                        )),
+                    );
+                    return Err(err);
+                }
+            }
+        }
+
+        if let Some(b) = config.sniff_redirect {
+            nconfig.domain_sniff.redirect = b;
+        }
+
         // Security
         if let Some(sec) = config.security
             && let Some(replay_attack) = sec.replay_attack
@@ -2886,6 +2943,11 @@ impl Config {
                 "missing any valid servers in configuration",
                 None,
             );
+            return Err(err);
+        }
+
+        if self.config_type.is_server() && self.domain_sniff.redirect && !self.domain_sniff.is_enabled() {
+            let err = Error::new(ErrorKind::Invalid, "sniff_redirect requires domain_sniff", None);
             return Err(err);
         }
 
@@ -3408,6 +3470,21 @@ impl fmt::Display for Config {
             jconf.outbound_proxy = SSOutboundProxyConfig::from_proxies(&self.outbound_proxy);
         }
 
+        // Domain sniffing
+        let mut sniff_protocols = Vec::new();
+        if self.domain_sniff.tls {
+            sniff_protocols.push("tls".to_owned());
+        }
+        if self.domain_sniff.http {
+            sniff_protocols.push("http".to_owned());
+        }
+        if !sniff_protocols.is_empty() {
+            jconf.domain_sniff = Some(sniff_protocols);
+        }
+        if self.domain_sniff.redirect {
+            jconf.sniff_redirect = Some(self.domain_sniff.redirect);
+        }
+
         // Security
         if self.security.replay_attack.policy != ReplayAttackPolicy::default() {
             jconf.security = Some(SSSecurityConfig {
@@ -3469,7 +3546,7 @@ pub fn read_variable_field_value(value: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::OutboundProxy;
+    use super::{Config, ConfigType, DomainSniffConfig, OutboundProxy};
 
     #[test]
     fn outbound_proxy_url_without_auth() {
@@ -3488,5 +3565,26 @@ mod tests {
         let auth = proxy.auth.expect("auth");
         assert_eq!(auth.username, "user");
         assert_eq!(auth.password, "pass");
+    }
+
+    #[test]
+    fn domain_sniff_config() {
+        const SERVER: &str = r#""server": "127.0.0.1", "server_port": 8388, "password": "", "method": "none""#;
+        let load = |options: &str| Config::load_from_str(&format!("{{ {SERVER}, {options} }}"), ConfigType::Server);
+        let all = DomainSniffConfig {
+            tls: true,
+            http: true,
+            redirect: true,
+        };
+
+        let config = load(r#""domain_sniff": ["tls", "http"], "sniff_redirect": true"#).unwrap();
+        assert_eq!(config.domain_sniff, all);
+        config.check_integrity().unwrap();
+
+        let config = Config::load_from_str(&config.to_string(), ConfigType::Server).unwrap();
+        assert_eq!(config.domain_sniff, all);
+
+        assert!(load(r#""domain_sniff": ["quic"]"#).is_err());
+        assert!(load(r#""sniff_redirect": true"#).unwrap().check_integrity().is_err());
     }
 }

@@ -21,6 +21,7 @@ pub use self::{
 pub mod context;
 #[allow(clippy::module_inception)]
 pub mod server;
+mod sniff;
 mod tcprelay;
 mod udprelay;
 
@@ -198,6 +199,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         }
 
         server_builder.set_security_config(&config.security);
+        server_builder.set_domain_sniff(config.domain_sniff);
 
         let server = server_builder.build().await?;
         servers.push(server);

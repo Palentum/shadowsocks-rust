@@ -939,6 +939,12 @@ Example configuration:
     //     "http://127.0.0.1:1081"
     // ],
 
+    // ssserver only, see "Domain Sniffing"
+    // Sniff the domain name of TCP requests to IP addresses, could be "tls", "http"
+    "domain_sniff": ["tls", "http"],
+    // Connect to the sniffed domain name instead of the requested IP address
+    "sniff_redirect": false,
+
     // Balancer customization
     "balancer": {
         // MAX Round-Trip-Time (RTT) of servers
@@ -1126,6 +1132,36 @@ Limitations:
 - Replay protection is limited: the authentication token has no timestamp, so each server only remembers the latest 100,000 to 200,000 authenticated `ClientHello`s in memory. A `ClientHello` replayed after that, or after a restart, passes authentication, and the server's handshake reveals that it is not `dest`.
 - The `ClientHello` has rustls' fingerprint. mihomo's `client-fingerprint: random` may trigger `HelloRetryRequest`, which is unsupported.
 - Use long random `username` and `password`, they protect the authentication token against offline brute-force.
+
+### Domain Sniffing
+
+Clients that resolve domain names by themselves send IP addresses to `ssserver`, so ACL domain rules never match them, and `ssserver`'s own `dns` is never used. With `domain_sniff`, `ssserver` waits up to 250ms for the first bytes of TCP requests to IP addresses, and looks for the domain name in them:
+
+- `tls`: SNI of the TLS `ClientHello`, which may span multiple reads or TLS records
+- `http`: `Host` header of HTTP/1.x requests, except requests to HTTP proxies
+
+The bytes read are then sent to the target unchanged. What the sniffed domain name does depends on `sniff_redirect`:
+
+- `false` (default): the connection still goes to the requested IP address, and is closed if the domain name matches `[outbound_block_list]`. The domain name comes from the client, so it is only used to block, `[outbound_allow_list]` and `[outbound_block_all]` still judge the IP address.
+- `true`: the connection goes to the domain name with the requested port, resolved by `ssserver`, as if the client requested it. ACL checks this domain name instead of the IP address. Addresses that the client pinned on purpose (hosts file, `curl --resolve`, ...) are ignored.
+
+```jsonc
+{
+    "server": "0.0.0.0",
+    "server_port": 8388,
+    "password": "password",
+    "method": "aes-256-gcm",
+    // Or command line: --domain-sniff tls,http --sniff-redirect
+    "domain_sniff": ["tls", "http"],
+    "sniff_redirect": true
+}
+```
+
+Limitations:
+
+- Only `ssserver` TCP relay, not `ssmanager`. UDP and QUIC are not sniffed.
+- Protocols that the server speaks first (SMTP, FTP, MySQL, ...) to IP addresses wait the full 250ms before connecting.
+- With TLS Encrypted Client Hello, the sniffed SNI is the public name of the ECH provider.
 
 ### Environment Variables
 
