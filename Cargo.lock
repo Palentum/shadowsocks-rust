@@ -3327,7 +3327,7 @@ dependencies = [
 
 [[package]]
 name = "shadowsocks"
-version = "1.25.0"
+version = "1.25.1"
 dependencies = [
  "aes 0.9.3",
  "arc-swap",
@@ -3394,7 +3394,7 @@ dependencies = [
 
 [[package]]
 name = "shadowsocks-rust"
-version = "1.25.0"
+version = "1.25.1"
 dependencies = [
  "base64 0.23.1",
  "build-time",
@@ -3435,7 +3435,7 @@ dependencies = [
 
 [[package]]
 name = "shadowsocks-service"
-version = "1.25.0"
+version = "1.25.1"
 dependencies = [
  "arc-swap",
  "base64 0.23.1",
