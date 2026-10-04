@@ -27,7 +27,7 @@ impl JlsClientOptions {
         let (mut host, mut username, mut password, mut alpn) = (None, None, None, None);
         for (key, value) in parse_pairs(opts, &["host", "username", "password", "alpn"])? {
             match key {
-                "host" => host = Some(value.to_ascii_lowercase()),
+                "host" => host = Some(value.to_owned()),
                 "username" => username = Some(value.to_owned()),
                 "password" => password = Some(value.to_owned()),
                 _ => alpn = Some(value.split(',').map(ToOwned::to_owned).collect()),
@@ -62,7 +62,7 @@ impl JlsServerOptions {
                 "username" => username = Some(value.to_owned()),
                 "password" => password = Some(value.to_owned()),
                 "dest" => dest = Some(parse_dest(value)?),
-                _ => sni = Some(value.to_ascii_lowercase()),
+                _ => sni = Some(value.to_owned()),
             }
         }
 
@@ -81,7 +81,7 @@ fn parse_dest(value: &str) -> io::Result<Address> {
     }
     match value.rsplit_once(':') {
         Some((host, port)) if !host.is_empty() => match port.parse::<u16>() {
-            Ok(port) => Ok(Address::DomainNameAddress(host.to_ascii_lowercase(), port)),
+            Ok(port) => Ok(Address::DomainNameAddress(host.to_owned(), port)),
             Err(..) => Err(invalid(format!("jls option `dest` = `{value}` has an invalid port"))),
         },
         _ => Err(invalid(format!(
@@ -122,7 +122,7 @@ mod test {
     #[test]
     fn parse_client_options() {
         let opts = JlsClientOptions::parse("host=WWW.Example.com;username=u;password=p").unwrap();
-        assert_eq!(opts.host, "www.example.com");
+        assert_eq!(opts.host, "WWW.Example.com");
         assert_eq!(opts.username, "u");
         assert_eq!(opts.password, "p");
         assert_eq!(opts.alpn, ["h2", "http/1.1"]);
@@ -141,12 +141,12 @@ mod test {
     #[test]
     fn parse_server_options() {
         let opts = JlsServerOptions::parse("username=u;password=p;dest=WWW.example.com:443").unwrap();
-        assert_eq!(opts.dest, Address::DomainNameAddress("www.example.com".to_owned(), 443));
+        assert_eq!(opts.dest, Address::DomainNameAddress("WWW.example.com".to_owned(), 443));
         assert_eq!(opts.sni, None);
 
         let opts = JlsServerOptions::parse("username=u;password=p;dest=127.0.0.1:8443;sni=A.com").unwrap();
         assert_eq!(opts.dest, Address::SocketAddress("127.0.0.1:8443".parse().unwrap()));
-        assert_eq!(opts.sni.as_deref(), Some("a.com"));
+        assert_eq!(opts.sni.as_deref(), Some("A.com"));
 
         assert!(JlsServerOptions::parse("username=u;password=p").is_err());
         assert!(JlsServerOptions::parse("username=u;password=p;dest=www.example.com").is_err());

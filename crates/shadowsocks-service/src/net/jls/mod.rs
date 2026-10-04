@@ -309,6 +309,13 @@ mod test {
     }
 
     #[tokio::test]
+    async fn sni_is_case_sensitive() {
+        let (client, server) = client_and_accept("host=WWW.Example.com;username=jls-user;password=jls-password").await;
+        assert!(client.is_err());
+        assert!(matches!(server.unwrap(), JlsAccepted::Fallback(..)));
+    }
+
+    #[tokio::test]
     async fn non_tls_falls_back() {
         const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: www.example.com\r\n\r\n";
 
