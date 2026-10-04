@@ -23,7 +23,9 @@ use tokio::{
     time,
 };
 
-use crate::net::{MonProxyStream, OutboundProxyStream, TcpDialer, utils::ignore_until_end};
+#[cfg(feature = "jls")]
+use crate::net::jls::{JlsAccepted, JlsAcceptor, is_jls_plugin};
+use crate::net::{MonProxyStream, OutboundProxyStream, TcpDialer, jls::MaybeJlsStream, utils::ignore_until_end};
 
 use super::context::ServiceContext;
 
@@ -84,6 +86,8 @@ pub struct TcpServer {
     context: Arc<ServiceContext>,
     svr_cfg: ServerConfig,
     listener: ProxyListener,
+    #[cfg(feature = "jls")]
+    jls: Option<Arc<JlsAcceptor>>,
 }
 
 impl TcpServer {
@@ -92,11 +96,19 @@ impl TcpServer {
         svr_cfg: ServerConfig,
         accept_opts: AcceptOpts,
     ) -> io::Result<Self> {
+        #[cfg(feature = "jls")]
+        let jls = match svr_cfg.plugin() {
+            Some(plugin) if is_jls_plugin(plugin) => Some(Arc::new(JlsAcceptor::new(plugin)?)),
+            _ => None,
+        };
+
         let listener = ProxyListener::bind_with_opts(context.context(), &svr_cfg, accept_opts).await?;
         Ok(Self {
             context,
             svr_cfg,
             listener,
+            #[cfg(feature = "jls")]
+            jls,
         })
     }
 
@@ -119,11 +131,38 @@ impl TcpServer {
         );
 
         loop {
+            #[cfg(feature = "jls")]
+            if let Some(ref acceptor) = self.jls {
+                // JLS handshake has to be completed before creating the ProxyServerStream
+                let (stream, peer_addr) = match self.listener.get_ref().accept().await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        error!("tcp server accept failed with error: {}", err);
+                        time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+
+                if self.context.check_client_blocked(&peer_addr) {
+                    warn!("access denied from {} by ACL rules", peer_addr);
+                    continue;
+                }
+
+                tokio::spawn(serve_jls(
+                    self.context.clone(),
+                    acceptor.clone(),
+                    self.svr_cfg.clone(),
+                    stream,
+                    peer_addr,
+                ));
+                continue;
+            }
+
             let flow_stat = self.context.flow_stat();
 
             let (local_stream, peer_addr) = match self
                 .listener
-                .accept_map(|s| MonProxyStream::from_stream(s, flow_stat))
+                .accept_map(|s| MonProxyStream::from_stream(MaybeJlsStream::Plain(s), flow_stat))
                 .await
             {
                 Ok(s) => s,
@@ -156,6 +195,60 @@ impl TcpServer {
     }
 }
 
+/// Serve a connection of a JLS server, forwarding unauthenticated clients to the camouflage website
+#[cfg(feature = "jls")]
+async fn serve_jls(
+    context: Arc<ServiceContext>,
+    acceptor: Arc<JlsAcceptor>,
+    svr_cfg: ServerConfig,
+    stream: TokioTcpStream,
+    peer_addr: SocketAddr,
+) {
+    match acceptor.accept(stream, svr_cfg.timeout()).await {
+        Ok(JlsAccepted::Authed(stream)) => {
+            let stream = ProxyServerStream::from_stream_with_user_manager(
+                context.context(),
+                MonProxyStream::from_stream(MaybeJlsStream::Jls(stream), context.flow_stat()),
+                svr_cfg.method(),
+                svr_cfg.key(),
+                svr_cfg.clone_user_manager(),
+            );
+
+            let client = TcpServerClient {
+                context,
+                method: svr_cfg.method(),
+                peer_addr,
+                stream,
+                timeout: svr_cfg.timeout(),
+            };
+
+            if let Err(err) = client.serve().await {
+                debug!("tcp server stream aborted with error: {}", err);
+            }
+        }
+        Ok(JlsAccepted::Fallback(stream, received)) => {
+            debug!(
+                "jls authentication failed, peer: {}, forwarding to {}",
+                peer_addr,
+                acceptor.dest()
+            );
+
+            if let Err(err) = acceptor
+                .forward(context.context_ref(), context.connect_opts_ref(), stream, &received)
+                .await
+            {
+                debug!(
+                    "jls forwarding {} -> {} aborted with error: {}",
+                    peer_addr,
+                    acceptor.dest(),
+                    err
+                );
+            }
+        }
+        Err(err) => debug!("jls handshake failed, peer: {}, {}", peer_addr, err),
+    }
+}
+
 #[inline]
 async fn timeout_fut<F, R>(duration: Option<Duration>, f: F) -> io::Result<R>
 where
@@ -174,7 +267,7 @@ struct TcpServerClient {
     context: Arc<ServiceContext>,
     method: CipherKind,
     peer_addr: SocketAddr,
-    stream: ProxyServerStream<MonProxyStream<TokioTcpStream>>,
+    stream: ProxyServerStream<MonProxyStream<MaybeJlsStream<TokioTcpStream>>>,
     timeout: Option<Duration>,
 }
 
@@ -219,7 +312,7 @@ impl TcpServerClient {
 
                     // tokio's TcpStream.set_linger was marked as deprecated.
                     // But we set linger(0), which won't block the thread when close() the socket.
-                    let _ = socket2::SockRef::from(&stream).set_linger(Some(Duration::ZERO));
+                    let _ = socket2::SockRef::from(stream.get_ref()).set_linger(Some(Duration::ZERO));
 
                     return Ok(());
                 }

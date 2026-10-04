@@ -16,7 +16,7 @@ use tokio::time;
 use crate::{
     acl::AccessControl,
     config::{OutboundProxy, SecurityConfig},
-    net::FlowStat,
+    net::{FlowStat, jls::is_jls_plugin},
     utils::ServerHandle,
 };
 
@@ -117,7 +117,7 @@ impl ServerBuilder {
 
     /// Start the server
     ///
-    /// 1. Starts plugin (subprocess)
+    /// 1. Starts plugin (subprocess), except JLS which runs in the TCP server
     /// 2. Starts TCP server (listener)
     /// 3. Starts UDP server (listener)
     pub async fn build(mut self) -> io::Result<Server> {
@@ -125,7 +125,9 @@ impl ServerBuilder {
 
         let mut plugin = None;
 
-        if let Some(plugin_cfg) = self.svr_cfg.plugin() {
+        if let Some(plugin_cfg) = self.svr_cfg.plugin()
+            && !is_jls_plugin(plugin_cfg)
+        {
             let plugin_process = Plugin::start(plugin_cfg, self.svr_cfg.addr(), PluginMode::Server)?;
             self.svr_cfg.set_plugin_addr(plugin_process.local_addr().into());
             plugin = Some(plugin_process);

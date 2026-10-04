@@ -36,7 +36,13 @@ use tokio::{
 use crate::{
     DEFAULT_UDP_EXPIRY_DURATION,
     local::net::udp::generate_client_session_id,
-    net::{FlowStat, MonProxySocket, MonProxyStream, packet_window::PacketWindowFilter},
+    net::{
+        FlowStat,
+        MonProxySocket,
+        MonProxyStream,
+        jls::{self, MaybeJlsStream},
+        packet_window::PacketWindowFilter,
+    },
 };
 
 /// DnsClient API errors
@@ -82,7 +88,7 @@ pub enum DnsClient {
         stream: UnixStream,
     },
     TcpRemote {
-        stream: ProxyClientStream<MonProxyStream<ShadowTcpStream>>,
+        stream: ProxyClientStream<MonProxyStream<MaybeJlsStream<ShadowTcpStream>>>,
     },
     UdpRemote {
         socket: MonProxySocket<ShadowUdpSocket>,
@@ -120,10 +126,9 @@ impl DnsClient {
         connect_opts: &ConnectOpts,
         flow_stat: Arc<FlowStat>,
     ) -> io::Result<Self> {
-        let stream = ProxyClientStream::connect_with_opts_map(context, svr_cfg, ns, connect_opts, |s| {
-            MonProxyStream::from_stream(s, flow_stat)
-        })
-        .await?;
+        let stream = jls::connect_server_with_opts(&context, svr_cfg, connect_opts).await?;
+        let stream =
+            ProxyClientStream::from_stream(context, MonProxyStream::from_stream(stream, flow_stat), svr_cfg, ns);
         Ok(Self::TcpRemote { stream })
     }
 
@@ -306,6 +311,7 @@ where
     BigEndian::write_u16(&mut req_bytes[0..2], length as u16);
 
     stream.write_all(&req_bytes).await?;
+    stream.flush().await?;
 
     // Read response, [LENGTH][Message]
     let mut length_buf = [0u8; 2];

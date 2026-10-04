@@ -100,6 +100,7 @@ full-extra = [
     "aead-cipher-extra",
     "aead-cipher-2022-extra",
     "security-replay-attack-detect",
+    "jls",
 ]
 
 # Enable local server
@@ -163,6 +164,10 @@ local-fake-dns = ["local", "shadowsocks-service/local-fake-dns", "ipnet"]
 # sslocal support online URL (SIP008 Online Configuration Delivery)
 # https://shadowsocks.org/doc/sip008.html
 local-online-config = ["local", "shadowsocks-service/local-online-config"]
+
+# Enable JLS transport (TLS 1.3 camouflage, configured as `plugin = "jls"`)
+# WARN: JLS is a non-standard extension and is not officially supported by shadowsocks community
+jls = ["shadowsocks-service/jls"]
 
 # ssurl support outline (ssconf) URL
 utility-url-outline = ["reqwest"]

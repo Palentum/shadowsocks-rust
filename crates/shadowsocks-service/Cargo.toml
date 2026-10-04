@@ -96,6 +96,10 @@ local-online-config = [
     "zstd",
 ]
 
+# Enable JLS transport (TLS 1.3 camouflage, configured as `plugin = "jls"`)
+# WARN: JLS is a non-standard extension and is not officially supported by shadowsocks community
+jls = ["rustls-jls", "rcgen"]
+
 # Enable Stream Cipher Protocol
 # WARN: Stream Cipher Protocol is proved to be insecure
 # https://github.com/shadowsocks/shadowsocks-rust/issues/373
@@ -155,6 +159,14 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
     "aws_lc_rs",
 ] }
 rustls-native-certs = { version = "0.8", optional = true }
+rustls-jls = { version = "1.3.7", optional = true, default-features = false, features = [
+    "std",
+    "aws_lc_rs",
+    "prefer-post-quantum",
+] }
+rcgen = { version = "0.14", optional = true, default-features = false, features = [
+    "aws_lc_rs",
+] }
 trait-variant = "0.1"
 
 socket2 = { version = "0.6", features = ["all"] }

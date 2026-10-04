@@ -20,6 +20,7 @@ use crate::crypto::{CipherCategory, CipherKind};
 
 struct CopyBuffer {
     read_done: bool,
+    need_flush: bool,
     pos: usize,
     cap: usize,
     amt: u64,
@@ -30,6 +31,7 @@ impl Debug for CopyBuffer {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("CopyBuffer")
             .field("read_done", &self.read_done)
+            .field("need_flush", &self.need_flush)
             .field("pos", &self.pos)
             .field("cap", &self.cap)
             .field("amt", &self.amt)
@@ -41,6 +43,7 @@ impl CopyBuffer {
     fn new(buffer_size: usize) -> Self {
         Self {
             read_done: false,
+            need_flush: false,
             pos: 0,
             cap: 0,
             amt: 0,
@@ -64,7 +67,20 @@ impl CopyBuffer {
             if self.pos == self.cap && !self.read_done {
                 let me = &mut *self;
                 let mut buf = ReadBuf::new(&mut me.buf);
-                ready!(reader.as_mut().poll_read(cx, &mut buf))?;
+                match reader.as_mut().poll_read(cx, &mut buf) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => {
+                        // Try flushing when the reader has no progress to avoid deadlock
+                        // when the reader depends on buffered writer.
+                        if self.need_flush {
+                            ready!(writer.as_mut().poll_flush(cx))?;
+                            self.need_flush = false;
+                        }
+
+                        return Poll::Pending;
+                    }
+                }
                 let n = buf.filled().len();
                 if n == 0 {
                     self.read_done = true;
@@ -86,6 +102,7 @@ impl CopyBuffer {
                 } else {
                     self.pos += i;
                     self.amt += i as u64;
+                    self.need_flush = true;
                 }
             }
 
@@ -355,4 +372,62 @@ where
         b_to_a: TransferState::Running(CopyBuffer::new(8192)),
     }
     .await
+}
+
+#[cfg(test)]
+mod test {
+    use std::{mem, task::Waker};
+
+    use super::*;
+
+    /// Returns `data` once, then stays pending
+    struct OneShotReader(Option<&'static [u8]>);
+
+    impl AsyncRead for OneShotReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            match self.0.take() {
+                Some(data) => {
+                    buf.put_slice(data);
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    /// Holds written data until it is flushed, like a TLS stream
+    #[derive(Default)]
+    struct BufferedWriter {
+        buffered: Vec<u8>,
+        flushed: Vec<u8>,
+    }
+
+    impl AsyncWrite for BufferedWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            self.buffered.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let buffered = mem::take(&mut self.buffered);
+            self.flushed.extend_from_slice(&buffered);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn copy_flushes_when_reader_pending() {
+        let mut reader = OneShotReader(Some(b"hello"));
+        let mut writer = BufferedWriter::default();
+        let mut buf = CopyBuffer::new(1024);
+        let mut cx = Context::from_waker(Waker::noop());
+
+        let r = buf.poll_copy(&mut cx, Pin::new(&mut reader), Pin::new(&mut writer));
+        assert!(r.is_pending());
+        assert_eq!(writer.flushed, b"hello");
+    }
 }

@@ -52,11 +52,13 @@ where
             Ok(Ok(n)) => {
                 // Send the first packet.
                 shadow.write_all(&buffer[..n]).await?;
+                shadow.flush().await?;
             }
             Ok(Err(err)) => return Err(err),
             Err(..) => {
                 // Timeout. Send handshake to server.
                 let _ = shadow.write(&[]).await?;
+                shadow.flush().await?;
 
                 trace!(
                     "tcp tunnel {} -> {} (proxied) sent handshake without data",

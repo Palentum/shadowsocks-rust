@@ -18,7 +18,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::{
     local::{context::ServiceContext, loadbalancing::ServerIdent},
-    net::{MonProxyStream, OutboundProxyStream, TcpDialer},
+    net::{
+        MonProxyStream,
+        OutboundProxyStream,
+        TcpDialer,
+        jls::{self, MaybeJlsStream},
+    },
 };
 
 use super::auto_proxy_io::AutoProxyIo;
@@ -122,7 +127,7 @@ impl<'a> TcpDialer for DirectTcpDialer<'a> {
 pub enum AutoProxyClientStream {
     /// Tunnel through the shadowsocks server (optionally over the outbound
     /// proxy chain).
-    Proxied(#[pin] ProxyClientStream<MonProxyStream<OutboundTransport>>),
+    Proxied(#[pin] ProxyClientStream<MonProxyStream<MaybeJlsStream<OutboundTransport>>>),
     /// Direct TCP, bypassing the shadowsocks server.
     Bypassed(#[pin] TcpStream),
 }
@@ -256,6 +261,12 @@ impl AutoProxyClientStream {
             }
         };
 
+        // Wrap in JLS if the server is configured with it
+        let dial_result = match dial_result {
+            Ok(transport) => jls::connect(server.server_config(), transport).await,
+            Err(err) => Err(err),
+        };
+
         let transport = match dial_result {
             Ok(t) => t,
             Err(err) => {
@@ -271,14 +282,14 @@ impl AutoProxyClientStream {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match *self {
-            Self::Proxied(ref s) => s.get_ref().get_ref().local_addr(),
+            Self::Proxied(ref s) => s.get_ref().get_ref().get_ref().local_addr(),
             Self::Bypassed(ref s) => s.local_addr(),
         }
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         match *self {
-            Self::Proxied(ref s) => s.get_ref().get_ref().set_nodelay(nodelay),
+            Self::Proxied(ref s) => s.get_ref().get_ref().get_ref().set_nodelay(nodelay),
             Self::Bypassed(ref s) => s.set_nodelay(nodelay),
         }
     }

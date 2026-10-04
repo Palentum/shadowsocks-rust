@@ -35,7 +35,7 @@ use tokio::{
     time,
 };
 
-use crate::{config::ServerInstanceConfig, local::context::ServiceContext};
+use crate::{config::ServerInstanceConfig, local::context::ServiceContext, net::jls};
 
 use super::{
     server_data::ServerIdent,
@@ -250,6 +250,13 @@ impl PingBalancerContext {
                 let svr_cfg = server.server_config_mut();
 
                 if let Some(p) = svr_cfg.plugin() {
+                    #[cfg(feature = "jls")]
+                    if jls::is_jls_plugin(p) {
+                        // JLS runs in-process, only validate its options here
+                        jls::JlsClientOptions::parse(p.plugin_opts.as_deref().unwrap_or_default())?;
+                        continue;
+                    }
+
                     // Start Plugin Process
                     let plugin = Plugin::start(p, svr_cfg.addr(), PluginMode::Client)?;
                     svr_cfg.set_plugin_addr(plugin.local_addr().into());
@@ -851,14 +858,16 @@ impl PingChecker {
 
         let addr = Address::DomainNameAddress("clients3.google.com".to_owned(), 80);
 
-        let mut stream = ProxyClientStream::connect_with_opts(
-            self.context.context(),
+        let stream = jls::connect_server_with_opts(
+            self.context.context_ref(),
             self.server.server_config(),
-            &addr,
             self.server.connect_opts_ref(),
         )
         .await?;
+        let mut stream =
+            ProxyClientStream::from_stream(self.context.context(), stream, self.server.server_config(), &addr);
         stream.write_all(GET_BODY).await?;
+        stream.flush().await?;
 
         let mut reader = BufReader::new(stream);
 
@@ -890,14 +899,16 @@ impl PingChecker {
 
         let addr = Address::DomainNameAddress("detectportal.firefox.com".to_owned(), 80);
 
-        let mut stream = ProxyClientStream::connect_with_opts(
-            self.context.context(),
+        let stream = jls::connect_server_with_opts(
+            self.context.context_ref(),
             self.server.server_config(),
-            &addr,
             self.server.connect_opts_ref(),
         )
         .await?;
+        let mut stream =
+            ProxyClientStream::from_stream(self.context.context(), stream, self.server.server_config(), &addr);
         stream.write_all(GET_BODY).await?;
+        stream.flush().await?;
 
         let mut reader = BufReader::new(stream);
 

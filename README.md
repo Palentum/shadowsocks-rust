@@ -66,6 +66,8 @@ Related Projects:
 
 - `aead-cipher-2022-extra` - Enable AEAD-2022 extra ciphers (non-standard ciphers)
 
+- `jls` - Enable [JLS](https://github.com/JimmyHuang454/JLS) transport, see [JLS Transport](#jls-transport) (non-standard, included in `full-extra`)
+
 #### Memory Allocators
 
 This project uses system (libc) memory allocator (Rust's default). But it also allows you to use other famous allocators by features:
@@ -1066,6 +1068,63 @@ The configuration file is set by `http_auth_config_path` in `locals`.
     }
 }
 ```
+
+### JLS Transport
+
+[JLS](https://github.com/JimmyHuang454/JLS) disguises the TCP connection as a TLS 1.3 connection to a real website without any certificate. The client hides an authentication token in the TLS `ClientHello`; connections that fail authentication (active probes, ordinary TLS clients) are forwarded byte-for-byte to the real website `dest`. The shadowsocks stream runs inside the TLS session, UDP is not affected.
+
+It is built in with feature `jls` and configured with the plugin fields, no plugin process will be started. `plugin_opts` is a `;` separated `key=value` list.
+
+```jsonc
+// ssserver
+{
+    "server": "0.0.0.0",
+    "server_port": 443,
+    "password": "password",
+    "method": "aes-256-gcm",
+    "plugin": "jls",
+    // dest: camouflage website, unauthenticated connections are forwarded to it
+    // sni: (optional) expected SNI from clients, default is the domain of `dest`
+    "plugin_opts": "username=JLS_USERNAME;password=JLS_PASSWORD;dest=www.example.com:443"
+}
+
+// sslocal
+{
+    "server": "SERVER_ADDRESS",
+    "server_port": 443,
+    "password": "password",
+    "method": "aes-256-gcm",
+    "plugin": "jls",
+    // host: SNI, must be the same as the server's `sni` (or `dest` domain), case-sensitive
+    // alpn: (optional) default is "h2,http/1.1"
+    "plugin_opts": "host=www.example.com;username=JLS_USERNAME;password=JLS_PASSWORD"
+}
+```
+
+It is compatible with [mihomo](https://github.com/MetaCubeX/mihomo) (v1.19.29+) shadowsocks with `plugin: jls`, both as a client and as a server (`jls-config`):
+
+```yaml
+proxies:
+  - name: ss-jls
+    type: ss
+    server: SERVER_ADDRESS
+    port: 443
+    cipher: aes-256-gcm
+    password: password
+    plugin: jls
+    plugin-opts:
+      host: www.example.com
+      username: JLS_USERNAME
+      password: JLS_PASSWORD
+```
+
+Limitations:
+
+- Only TCP is carried by JLS, UDP is relayed as plain shadowsocks UDP.
+- One JLS user per server.
+- Fallback connections are connected to `dest` directly, without rate limit or loop detection.
+- The `ClientHello` has rustls' fingerprint. mihomo's `client-fingerprint: random` may trigger `HelloRetryRequest`, which is unsupported.
+- Use long random `username` and `password`, they protect the authentication token against offline brute-force.
 
 ### Environment Variables
 
