@@ -403,6 +403,9 @@ struct SSConfig {
     sniff_redirect: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    udp_over_tcp: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     security: Option<SSSecurityConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1641,6 +1644,9 @@ pub struct Config {
     /// Domain sniffing of server's TCP requests to IP addresses
     pub domain_sniff: DomainSniffConfig,
 
+    /// sing-box UDP over TCP of server
+    pub udp_over_tcp: bool,
+
     /// Balancer config of local server
     pub balancer: BalancerConfig,
 
@@ -1773,6 +1779,8 @@ impl Config {
             security: SecurityConfig::default(),
 
             domain_sniff: DomainSniffConfig::default(),
+
+            udp_over_tcp: false,
 
             balancer: BalancerConfig::default(),
 
@@ -2677,6 +2685,10 @@ impl Config {
             nconfig.domain_sniff.redirect = b;
         }
 
+        if let Some(b) = config.udp_over_tcp {
+            nconfig.udp_over_tcp = b;
+        }
+
         // Security
         if let Some(sec) = config.security
             && let Some(replay_attack) = sec.replay_attack
@@ -3485,6 +3497,10 @@ impl fmt::Display for Config {
             jconf.sniff_redirect = Some(self.domain_sniff.redirect);
         }
 
+        if self.udp_over_tcp {
+            jconf.udp_over_tcp = Some(self.udp_over_tcp);
+        }
+
         // Security
         if self.security.replay_attack.policy != ReplayAttackPolicy::default() {
             jconf.security = Some(SSSecurityConfig {
@@ -3586,5 +3602,19 @@ mod tests {
 
         assert!(load(r#""domain_sniff": ["quic"]"#).is_err());
         assert!(load(r#""sniff_redirect": true"#).unwrap().check_integrity().is_err());
+    }
+
+    #[test]
+    fn udp_over_tcp_config() {
+        const SERVER: &str = r#""server": "127.0.0.1", "server_port": 8388, "password": "", "method": "none""#;
+        let load = |options: &str| Config::load_from_str(&format!("{{ {SERVER}{options} }}"), ConfigType::Server);
+
+        assert!(!load("").unwrap().udp_over_tcp);
+
+        let config = load(r#", "udp_over_tcp": true"#).unwrap();
+        assert!(config.udp_over_tcp);
+
+        let config = Config::load_from_str(&config.to_string(), ConfigType::Server).unwrap();
+        assert!(config.udp_over_tcp);
     }
 }

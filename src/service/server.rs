@@ -150,6 +150,7 @@ pub fn define_command_line_options(mut app: Command) -> Command {
         .arg(Arg::new("ACL").long("acl").num_args(1).action(ArgAction::Set).value_hint(ValueHint::FilePath).help("Path to ACL (Access Control List)"))
         .arg(Arg::new("DOMAIN_SNIFF").long("domain-sniff").num_args(1).action(ArgAction::Append).value_delimiter(',').value_parser(PossibleValuesParser::new(["tls", "http"])).help("Sniff the domain name of TCP requests to IP addresses from TLS SNI or HTTP Host, e.g. \"tls,http\""))
         .arg(Arg::new("SNIFF_REDIRECT").long("sniff-redirect").action(ArgAction::SetTrue).help("Connect to the sniffed domain name instead of the requested IP address"))
+        .arg(Arg::new("UDP_OVER_TCP").long("udp-over-tcp").action(ArgAction::SetTrue).help("Accept sing-box UDP over TCP (v1 and v2) requests"))
         .arg(Arg::new("DNS").long("dns").num_args(1).action(ArgAction::Set).help("DNS nameservers, formatted like [(tcp|udp)://]host[:port][,host[:port]]..., or unix:///path/to/dns, or predefined keys like \"google\", \"cloudflare\""))
         .arg(Arg::new("DNS_CACHE_SIZE").long("dns-cache-size").num_args(1).action(ArgAction::Set).value_parser(clap::value_parser!(usize)).help("DNS cache size in number of records. Works when trust-dns DNS backend is enabled."))
         .arg(Arg::new("TCP_NO_DELAY").long("tcp-no-delay").alias("no-delay").action(ArgAction::SetTrue).help("Set TCP_NODELAY option for sockets"))
@@ -476,6 +477,10 @@ pub fn create(matches: &ArgMatches) -> ShadowsocksResult<(Runtime, impl Future<O
 
         if matches.get_flag("SNIFF_REDIRECT") {
             config.domain_sniff.redirect = true;
+        }
+
+        if matches.get_flag("UDP_OVER_TCP") {
+            config.udp_over_tcp = true;
         }
 
         if let Some(dns) = matches.get_one::<String>("DNS") {

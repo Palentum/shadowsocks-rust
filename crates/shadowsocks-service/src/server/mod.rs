@@ -24,6 +24,7 @@ pub mod server;
 mod sniff;
 mod tcprelay;
 mod udprelay;
+mod uot;
 
 /// Default TCP Keep Alive timeout
 ///
@@ -113,6 +114,13 @@ pub async fn run(config: Config) -> io::Result<()> {
     for inst in config.server {
         let svr_cfg = inst.config;
         let svr_enable_udp = svr_cfg.mode().enable_udp();
+        if config.udp_over_tcp && !svr_cfg.mode().enable_tcp() {
+            log::warn!(
+                "udp_over_tcp requires TCP, server {} is in {} mode",
+                svr_cfg.addr(),
+                svr_cfg.mode()
+            );
+        }
         let mut server_builder = ServerBuilder::new(svr_cfg);
 
         if let Some(ref r) = resolver {
@@ -169,6 +177,10 @@ pub async fn run(config: Config) -> io::Result<()> {
                 }
             }
 
+            if config.udp_over_tcp {
+                log::warn!("udp_over_tcp traffic will bypass the outbound proxy chain");
+            }
+
             server_builder.set_outbound_proxies(proxies);
         }
 
@@ -200,6 +212,7 @@ pub async fn run(config: Config) -> io::Result<()> {
 
         server_builder.set_security_config(&config.security);
         server_builder.set_domain_sniff(config.domain_sniff);
+        server_builder.set_udp_over_tcp(config.udp_over_tcp);
 
         let server = server_builder.build().await?;
         servers.push(server);

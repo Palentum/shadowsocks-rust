@@ -1,6 +1,6 @@
 //! Shadowsocks Local Server Context
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use shadowsocks::{
     config::ServerType,
@@ -34,6 +34,12 @@ pub struct ServiceContext {
 
     // Domain sniffing of TCP requests to IP addresses
     domain_sniff: DomainSniffConfig,
+
+    // sing-box UDP over TCP
+    udp_over_tcp: bool,
+
+    // UDP association's expiry duration
+    udp_expiry_duration: Duration,
 }
 
 impl Default for ServiceContext {
@@ -45,6 +51,8 @@ impl Default for ServiceContext {
             flow_stat: Arc::new(FlowStat::new()),
             outbound_client: None,
             domain_sniff: DomainSniffConfig::default(),
+            udp_over_tcp: false,
+            udp_expiry_duration: crate::DEFAULT_UDP_EXPIRY_DURATION,
         }
     }
 }
@@ -164,5 +172,25 @@ impl ServiceContext {
     /// Get domain sniffing of TCP requests to IP addresses
     pub fn domain_sniff(&self) -> DomainSniffConfig {
         self.domain_sniff
+    }
+
+    /// Set sing-box UDP over TCP
+    pub fn set_udp_over_tcp(&mut self, udp_over_tcp: bool) {
+        self.udp_over_tcp = udp_over_tcp;
+    }
+
+    /// Check if sing-box UDP over TCP is enabled
+    pub fn udp_over_tcp(&self) -> bool {
+        self.udp_over_tcp
+    }
+
+    /// Set UDP association's expiry duration
+    pub fn set_udp_expiry_duration(&mut self, d: Duration) {
+        self.udp_expiry_duration = d;
+    }
+
+    /// Get UDP association's expiry duration
+    pub fn udp_expiry_duration(&self) -> Duration {
+        self.udp_expiry_duration
     }
 }

@@ -945,6 +945,10 @@ Example configuration:
     // Connect to the sniffed domain name instead of the requested IP address
     "sniff_redirect": false,
 
+    // ssserver only, see "UDP over TCP"
+    // Accept sing-box compatible UDP over TCP (UoT v1 and v2) on the TCP listener
+    "udp_over_tcp": false,
+
     // Balancer customization
     "balancer": {
         // MAX Round-Trip-Time (RTT) of servers
@@ -1162,6 +1166,61 @@ Limitations:
 - Only `ssserver` TCP relay, not `ssmanager`. UDP and QUIC are not sniffed.
 - Protocols that the server speaks first (SMTP, FTP, MySQL, ...) to IP addresses wait the full 250ms before connecting.
 - With TLS Encrypted Client Hello, the sniffed SNI is the public name of the ECH provider.
+
+### UDP over TCP
+
+`ssserver` can relay UDP packets through the TCP connection, compatible with the "UDP over TCP" (UoT) of sing-box and mihomo, for networks where UDP is blocked or unstable. A UoT connection is a normal Shadowsocks TCP connection whose target is a magic domain name: `sp.v2.udp-over-tcp.arpa` for UoT v2 (both connect and non-connect modes), or `sp.udp-over-tcp.arpa` for legacy v1. `ssserver` then relays the UDP packets carried in that stream.
+
+```jsonc
+{
+    "server": "0.0.0.0",
+    "server_port": 8388,
+    "password": "password",
+    "method": "2022-blake3-aes-256-gcm",
+    // Or command line: --udp-over-tcp
+    "udp_over_tcp": true
+}
+```
+
+sing-box client outbound:
+
+```jsonc
+{
+    "type": "shadowsocks",
+    "server": "example.com",
+    "server_port": 8388,
+    "method": "2022-blake3-aes-256-gcm",
+    "password": "password",
+    "udp_over_tcp": {
+        "enabled": true,
+        "version": 2
+    }
+}
+```
+
+mihomo (Clash.Meta) proxy:
+
+```yaml
+proxies:
+  - name: ss-uot
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: 2022-blake3-aes-256-gcm
+    password: password
+    udp: true
+    udp-over-tcp: true
+    udp-over-tcp-version: 2 # defaults to 1 if omitted, both versions work
+```
+
+Notes:
+
+- UoT rides the TCP listener, so `mode` must be `tcp_only` or `tcp_and_udp`. `udp_only` has no TCP listener, so UoT is unavailable there. The UDP port does not need to be reachable.
+- The target of each UDP packet is checked against the ACL, the same as the UDP relay. The magic domain name itself is not subject to ACL or DNS.
+- UDP packets are sent directly from the server, not through `outbound_proxy`, the same as the UDP relay.
+- An idle UoT connection is closed after `udp_timeout` (default 5 minutes) without traffic in either direction.
+- Works with plugins and JLS transport, because UoT is handled after decryption.
+- Only `ssserver`, not `ssmanager`.
 
 ### Environment Variables
 

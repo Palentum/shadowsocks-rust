@@ -26,7 +26,6 @@ use super::{context::ServiceContext, tcprelay::TcpServer, udprelay::UdpServer};
 pub struct ServerBuilder {
     context: ServiceContext,
     svr_cfg: ServerConfig,
-    udp_expiry_duration: Option<Duration>,
     udp_capacity: Option<usize>,
     manager_addr: Option<ManagerAddr>,
     accept_opts: AcceptOpts,
@@ -43,7 +42,6 @@ impl ServerBuilder {
         Self {
             context,
             svr_cfg,
-            udp_expiry_duration: None,
             udp_capacity: None,
             manager_addr: None,
             accept_opts: AcceptOpts::default(),
@@ -67,7 +65,7 @@ impl ServerBuilder {
 
     /// Set UDP association's expiry duration
     pub fn set_udp_expiry_duration(&mut self, d: Duration) {
-        self.udp_expiry_duration = Some(d);
+        self.context.set_udp_expiry_duration(d);
     }
 
     /// Set total UDP associations to be kept in one server
@@ -120,6 +118,11 @@ impl ServerBuilder {
         self.context.set_domain_sniff(domain_sniff);
     }
 
+    /// Set sing-box UDP over TCP
+    pub fn set_udp_over_tcp(&mut self, udp_over_tcp: bool) {
+        self.context.set_udp_over_tcp(udp_over_tcp);
+    }
+
     /// Start the server
     ///
     /// 1. Starts plugin (subprocess), except JLS which runs in the TCP server
@@ -149,7 +152,6 @@ impl ServerBuilder {
             let server = UdpServer::new(
                 context.clone(),
                 self.svr_cfg.clone(),
-                self.udp_expiry_duration,
                 self.udp_capacity,
                 self.accept_opts.clone(),
             )

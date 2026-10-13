@@ -90,11 +90,10 @@ impl UdpServer {
     pub(crate) async fn new(
         context: Arc<ServiceContext>,
         svr_cfg: ServerConfig,
-        time_to_live: Option<Duration>,
         capacity: Option<usize>,
         accept_opts: AcceptOpts,
     ) -> io::Result<Self> {
-        let time_to_live = time_to_live.unwrap_or(crate::DEFAULT_UDP_EXPIRY_DURATION);
+        let time_to_live = context.udp_expiry_duration();
 
         fn create_assoc_map<K, V>(time_to_live: Duration, capacity: Option<usize>) -> LruCache<K, V>
         where
@@ -568,22 +567,6 @@ impl UdpAssociationContext {
                 }
             }
         }
-
-        #[inline]
-        async fn receive_from_outbound_opt(
-            socket: &Option<OutboundUdpSocket>,
-            buf: &mut Vec<u8>,
-        ) -> io::Result<(usize, SocketAddr)> {
-            match *socket {
-                None => future::pending().await,
-                Some(ref s) => {
-                    if buf.is_empty() {
-                        buf.resize(MAXIMUM_UDP_PAYLOAD_SIZE, 0);
-                    }
-                    s.recv_from(buf).await
-                }
-            }
-        }
     }
 
     async fn dispatch_received_packet(
@@ -638,7 +621,16 @@ impl UdpAssociationContext {
             session_context.client_user.clone_from(&control.user);
         }
 
-        if let Err(err) = self.dispatch_received_outbound_packet(target_addr, data).await {
+        if let Err(err) = send_outbound_packet(
+            &self.context,
+            self.peer_addr,
+            &mut self.outbound_ipv4_socket,
+            &mut self.outbound_ipv6_socket,
+            target_addr,
+            data,
+        )
+        .await
+        {
             error!(
                 "udp relay {} -> {} with {} bytes, error: {}",
                 self.peer_addr,
@@ -646,83 +638,6 @@ impl UdpAssociationContext {
                 data.len(),
                 err
             );
-        }
-    }
-
-    async fn dispatch_received_outbound_packet(&mut self, target_addr: &Address, data: &[u8]) -> io::Result<()> {
-        match *target_addr {
-            Address::SocketAddress(sa) => self.send_received_outbound_packet(sa, data).await,
-            Address::DomainNameAddress(ref dname, port) => {
-                lookup_then!(self.context.context_ref(), dname, port, |sa| {
-                    self.send_received_outbound_packet(sa, data).await
-                })
-                .map(|_| ())
-            }
-        }
-    }
-
-    async fn send_received_outbound_packet(&mut self, original_target_addr: SocketAddr, data: &[u8]) -> io::Result<()> {
-        let ip_stack_caps = get_ip_stack_capabilities();
-
-        let target_addr = match original_target_addr {
-            SocketAddr::V4(ref v4) => {
-                // If IPv4-mapped-IPv6 is supported.
-                // Converts IPv4 address to IPv4-mapped-IPv6
-                // All sockets will be created in IPv6 (nearly all modern OS supports IPv6 sockets)
-                if ip_stack_caps.support_ipv4_mapped_ipv6 {
-                    SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port())
-                } else {
-                    original_target_addr
-                }
-            }
-            SocketAddr::V6(ref v6) => {
-                // If IPv6 is not supported. Try to map it back to IPv4.
-                if !ip_stack_caps.support_ipv6 || !ip_stack_caps.support_ipv4_mapped_ipv6 {
-                    match v6.ip().to_ipv4_mapped() {
-                        Some(v4) => SocketAddr::new(v4.into(), v6.port()),
-                        None => original_target_addr,
-                    }
-                } else {
-                    original_target_addr
-                }
-            }
-        };
-
-        let socket = match target_addr {
-            SocketAddr::V4(..) => match self.outbound_ipv4_socket {
-                Some(ref mut socket) => socket,
-                None => {
-                    let socket =
-                        OutboundUdpSocket::connect_any_with_opts(AddrFamily::Ipv4, self.context.connect_opts_ref())
-                            .await?;
-                    self.outbound_ipv4_socket.insert(socket)
-                }
-            },
-            SocketAddr::V6(..) => match self.outbound_ipv6_socket {
-                Some(ref mut socket) => socket,
-                None => {
-                    let socket =
-                        OutboundUdpSocket::connect_any_with_opts(AddrFamily::Ipv6, self.context.connect_opts_ref())
-                            .await?;
-                    self.outbound_ipv6_socket.insert(socket)
-                }
-            },
-        };
-
-        match socket.send_to(data, target_addr).await {
-            Ok(n) => {
-                if n != data.len() {
-                    warn!(
-                        "{} -> {} sent {} bytes != expected {} bytes",
-                        self.peer_addr,
-                        target_addr,
-                        n,
-                        data.len()
-                    );
-                }
-                Ok(())
-            }
-            Err(err) => Err(err),
         }
     }
 
@@ -814,6 +729,113 @@ impl UdpAssociationContext {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Send a packet to `target_addr` with the outbound socket of its address family, creating it if needed
+pub(super) async fn send_outbound_packet(
+    context: &ServiceContext,
+    peer_addr: SocketAddr,
+    outbound_ipv4_socket: &mut Option<OutboundUdpSocket>,
+    outbound_ipv6_socket: &mut Option<OutboundUdpSocket>,
+    target_addr: &Address,
+    data: &[u8],
+) -> io::Result<()> {
+    match *target_addr {
+        Address::SocketAddress(sa) => {
+            send_outbound_socket_packet(context, peer_addr, outbound_ipv4_socket, outbound_ipv6_socket, sa, data).await
+        }
+        Address::DomainNameAddress(ref dname, port) => lookup_then!(context.context_ref(), dname, port, |sa| {
+            send_outbound_socket_packet(context, peer_addr, outbound_ipv4_socket, outbound_ipv6_socket, sa, data).await
+        })
+        .map(|_| ()),
+    }
+}
+
+async fn send_outbound_socket_packet(
+    context: &ServiceContext,
+    peer_addr: SocketAddr,
+    outbound_ipv4_socket: &mut Option<OutboundUdpSocket>,
+    outbound_ipv6_socket: &mut Option<OutboundUdpSocket>,
+    original_target_addr: SocketAddr,
+    data: &[u8],
+) -> io::Result<()> {
+    let ip_stack_caps = get_ip_stack_capabilities();
+
+    let target_addr = match original_target_addr {
+        SocketAddr::V4(ref v4) => {
+            // If IPv4-mapped-IPv6 is supported.
+            // Converts IPv4 address to IPv4-mapped-IPv6
+            // All sockets will be created in IPv6 (nearly all modern OS supports IPv6 sockets)
+            if ip_stack_caps.support_ipv4_mapped_ipv6 {
+                SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port())
+            } else {
+                original_target_addr
+            }
+        }
+        SocketAddr::V6(ref v6) => {
+            // If IPv6 is not supported. Try to map it back to IPv4.
+            if !ip_stack_caps.support_ipv6 || !ip_stack_caps.support_ipv4_mapped_ipv6 {
+                match v6.ip().to_ipv4_mapped() {
+                    Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+                    None => original_target_addr,
+                }
+            } else {
+                original_target_addr
+            }
+        }
+    };
+
+    let socket = match target_addr {
+        SocketAddr::V4(..) => match *outbound_ipv4_socket {
+            Some(ref mut socket) => socket,
+            None => {
+                let socket =
+                    OutboundUdpSocket::connect_any_with_opts(AddrFamily::Ipv4, context.connect_opts_ref()).await?;
+                outbound_ipv4_socket.insert(socket)
+            }
+        },
+        SocketAddr::V6(..) => match *outbound_ipv6_socket {
+            Some(ref mut socket) => socket,
+            None => {
+                let socket =
+                    OutboundUdpSocket::connect_any_with_opts(AddrFamily::Ipv6, context.connect_opts_ref()).await?;
+                outbound_ipv6_socket.insert(socket)
+            }
+        },
+    };
+
+    match socket.send_to(data, target_addr).await {
+        Ok(n) => {
+            if n != data.len() {
+                warn!(
+                    "{} -> {} sent {} bytes != expected {} bytes",
+                    peer_addr,
+                    target_addr,
+                    n,
+                    data.len()
+                );
+            }
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Receive a packet from an outbound socket, pending forever if it is not created
+#[inline]
+pub(super) async fn receive_from_outbound_opt(
+    socket: &Option<OutboundUdpSocket>,
+    buf: &mut Vec<u8>,
+) -> io::Result<(usize, SocketAddr)> {
+    match *socket {
+        None => future::pending().await,
+        Some(ref s) => {
+            if buf.is_empty() {
+                buf.resize(MAXIMUM_UDP_PAYLOAD_SIZE, 0);
+            }
+            s.recv_from(buf).await
         }
     }
 }

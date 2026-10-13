@@ -27,7 +27,7 @@ use tokio::{
 use crate::net::jls::{JlsAccepted, JlsAcceptor, is_jls_plugin};
 use crate::net::{MonProxyStream, OutboundProxyStream, TcpDialer, jls::MaybeJlsStream, utils::ignore_until_end};
 
-use super::{context::ServiceContext, sniff::sniff_domain};
+use super::{context::ServiceContext, sniff::sniff_domain, uot};
 
 /// `TcpDialer` adapter that uses the server's connect-options.
 struct ServerTcpDialer<'a> {
@@ -340,6 +340,15 @@ impl TcpServerClient {
             "accepted tcp client connection {}, establishing tunnel to {}",
             self.peer_addr, target_addr
         );
+
+        // sing-box UDP over TCP, packets' targets are checked by ACL instead of the magic address
+        if self.context.udp_over_tcp()
+            && let Some(version) = uot::uot_version(&target_addr)
+        {
+            // Small packets shouldn't wait for delayed ACKs, Go sets TCP_NODELAY by default
+            let _ = self.stream.get_ref().get_ref().get_ref().set_nodelay(true);
+            return uot::serve(self.context, self.peer_addr, self.stream, version).await;
+        }
 
         // Bytes read ahead by sniffing, sent to the target first
         let mut first_packet = None;
