@@ -27,7 +27,7 @@ use tokio::{
 use crate::net::jls::{JlsAccepted, JlsAcceptor, is_jls_plugin};
 use crate::net::{MonProxyStream, OutboundProxyStream, TcpDialer, jls::MaybeJlsStream, utils::ignore_until_end};
 
-use super::{context::ServiceContext, sniff::sniff_domain, uot};
+use super::{context::ServiceContext, mux, sniff::sniff_domain, uot};
 
 /// `TcpDialer` adapter that uses the server's connect-options.
 struct ServerTcpDialer<'a> {
@@ -42,7 +42,7 @@ impl<'a> TcpDialer for ServerTcpDialer<'a> {
 }
 
 /// Unified outbound stream: either direct or through the outbound proxy chain.
-enum RemoteStream {
+pub(super) enum RemoteStream {
     Direct(OutboundTcpStream),
     Proxied(OutboundProxyStream),
 }
@@ -250,7 +250,7 @@ async fn serve_jls(
 }
 
 #[inline]
-async fn timeout_fut<F, R>(duration: Option<Duration>, f: F) -> io::Result<R>
+pub(super) async fn timeout_fut<F, R>(duration: Option<Duration>, f: F) -> io::Result<R>
 where
     F: Future<Output = io::Result<R>>,
 {
@@ -272,6 +272,11 @@ struct TcpServerClient {
 }
 
 impl TcpServerClient {
+    /// For UoT and multiplex, small packets shouldn't wait for delayed ACKs, Go sets TCP_NODELAY by default
+    fn set_nodelay(&self) {
+        let _ = self.stream.get_ref().get_ref().get_ref().set_nodelay(true);
+    }
+
     async fn serve(mut self) -> io::Result<()> {
         // let target_addr = match Address::read_from(&mut self.stream).await {
         let mut target_addr = match timeout_fut(self.timeout, self.stream.handshake()).await {
@@ -345,110 +350,28 @@ impl TcpServerClient {
         if self.context.udp_over_tcp()
             && let Some(version) = uot::uot_version(&target_addr)
         {
-            // Small packets shouldn't wait for delayed ACKs, Go sets TCP_NODELAY by default
-            let _ = self.stream.get_ref().get_ref().get_ref().set_nodelay(true);
+            self.set_nodelay();
             return uot::serve(self.context, self.peer_addr, self.stream, version).await;
         }
 
-        // Bytes read ahead by sniffing, sent to the target first
-        let mut first_packet = None;
-        let domain_sniff = self.context.domain_sniff();
-        if domain_sniff.is_enabled() && matches!(target_addr, Address::SocketAddress(..)) {
-            let (packet, domain) = sniff_domain(&mut self.stream, domain_sniff).await?;
-            if let Some(domain) = domain {
-                if domain_sniff.redirect {
-                    debug!(
-                        "tcp client {} sniffed {} for {}, redirecting",
-                        self.peer_addr, domain, target_addr
-                    );
-                    target_addr = Address::DomainNameAddress(domain, target_addr.port());
-                } else if self.context.check_outbound_host_blocked(&domain) {
-                    // The sniffed domain name is not what we connect to, it can only block
-                    error!(
-                        "tcp client {} outbound {} (sniffed {}) blocked by ACL rules",
-                        self.peer_addr, target_addr, domain
-                    );
-                    return Ok(());
-                }
-            }
-            first_packet = Some(packet);
+        // sing-box multiplex, streams' targets are checked by ACL instead of the magic address
+        if self.context.multiplex() && mux::is_mux_address(&target_addr) {
+            self.set_nodelay();
+            return mux::serve(self.context, self.peer_addr, self.stream, self.timeout).await;
         }
 
-        if self.context.check_outbound_blocked(&target_addr).await {
-            error!(
-                "tcp client {} outbound {} blocked by ACL rules",
-                self.peer_addr, target_addr
-            );
-            return Ok(());
-        }
-
-        let mut remote_stream = match timeout_fut(self.timeout, async {
-            match self.context.outbound_client() {
-                None => OutboundTcpStream::connect_remote_with_opts(
-                    self.context.context_ref(),
-                    &target_addr,
-                    self.context.connect_opts_ref(),
-                )
-                .await
-                .map(RemoteStream::Direct),
-                Some(client) => {
-                    let dialer = ServerTcpDialer {
-                        context: self.context.as_ref(),
-                    };
-                    client
-                        .connect_tcp(&dialer, &target_addr)
-                        .await
-                        .map(RemoteStream::Proxied)
-                }
-            }
-        })
-        .await
+        let mut remote_stream = match connect_target(
+            &self.context,
+            self.peer_addr,
+            &mut self.stream,
+            &mut target_addr,
+            self.timeout,
+        )
+        .await?
         {
-            Ok(s) => s,
-            Err(err) => {
-                error!(
-                    "tcp tunnel {} -> {} connect failed, error: {}",
-                    self.peer_addr, target_addr, err
-                );
-                return Err(err);
-            }
+            TcpConnect::Connected(s) => s,
+            TcpConnect::Blocked | TcpConnect::Closed => return Ok(()),
         };
-
-        // https://github.com/shadowsocks/shadowsocks-rust/issues/232
-        //
-        // Protocols like FTP, clients will wait for servers to send Welcome Message without sending anything.
-        //
-        // Wait at most 500ms, and then sends handshake packet to remote servers.
-        if let Some(packet) = first_packet {
-            // Sniffing has already waited for the first packet
-            if !packet.is_empty() {
-                timeout_fut(self.timeout, remote_stream.write_all(&packet)).await?;
-            } else if self.context.connect_opts_ref().tcp.fastopen {
-                timeout_fut(self.timeout, remote_stream.write(&[])).await?;
-            }
-        } else if self.context.connect_opts_ref().tcp.fastopen {
-            let mut buffer = [0u8; 8192];
-            match time::timeout(Duration::from_millis(500), self.stream.read(&mut buffer)).await {
-                Ok(Ok(0)) => {
-                    // EOF. Just terminate right here.
-                    return Ok(());
-                }
-                Ok(Ok(n)) => {
-                    // Send the first packet.
-                    timeout_fut(self.timeout, remote_stream.write_all(&buffer[..n])).await?;
-                }
-                Ok(Err(err)) => return Err(err),
-                Err(..) => {
-                    // Timeout. Send handshake to server.
-                    timeout_fut(self.timeout, remote_stream.write(&[])).await?;
-
-                    trace!(
-                        "tcp tunnel {} -> {} sent TFO connect without data",
-                        self.peer_addr, target_addr
-                    );
-                }
-            }
-        }
 
         debug!(
             "established tcp tunnel {} <-> {} with {:?}",
@@ -474,4 +397,125 @@ impl TcpServerClient {
 
         Ok(())
     }
+}
+
+/// Result of connecting to the target of a client stream
+#[allow(clippy::large_enum_variant)] // Unwrapped immediately, not worth boxing
+pub(super) enum TcpConnect {
+    Connected(RemoteStream),
+    /// Blocked by ACL rules
+    Blocked,
+    /// Closed by the client before sending anything
+    Closed,
+}
+
+/// Connect to `target_addr` for a client `stream`, after domain sniffing and ACL checks.
+///
+/// The first packet of the client is sent to the target, and `target_addr` may be redirected to the sniffed domain name.
+pub(super) async fn connect_target<S>(
+    context: &ServiceContext,
+    peer_addr: SocketAddr,
+    stream: &mut S,
+    target_addr: &mut Address,
+    timeout: Option<Duration>,
+) -> io::Result<TcpConnect>
+where
+    S: AsyncRead + Unpin,
+{
+    // Bytes read ahead by sniffing, sent to the target first
+    let mut first_packet = None;
+    let domain_sniff = context.domain_sniff();
+    if domain_sniff.is_enabled() && matches!(*target_addr, Address::SocketAddress(..)) {
+        let (packet, domain) = sniff_domain(stream, domain_sniff).await?;
+        if let Some(domain) = domain {
+            if domain_sniff.redirect {
+                debug!(
+                    "tcp client {} sniffed {} for {}, redirecting",
+                    peer_addr, domain, target_addr
+                );
+                *target_addr = Address::DomainNameAddress(domain, target_addr.port());
+            } else if context.check_outbound_host_blocked(&domain) {
+                // The sniffed domain name is not what we connect to, it can only block
+                error!(
+                    "tcp client {} outbound {} (sniffed {}) blocked by ACL rules",
+                    peer_addr, target_addr, domain
+                );
+                return Ok(TcpConnect::Blocked);
+            }
+        }
+        first_packet = Some(packet);
+    }
+
+    if context.check_outbound_blocked(target_addr).await {
+        error!("tcp client {} outbound {} blocked by ACL rules", peer_addr, target_addr);
+        return Ok(TcpConnect::Blocked);
+    }
+
+    let mut remote_stream = match timeout_fut(timeout, async {
+        match context.outbound_client() {
+            None => OutboundTcpStream::connect_remote_with_opts(
+                context.context_ref(),
+                target_addr,
+                context.connect_opts_ref(),
+            )
+            .await
+            .map(RemoteStream::Direct),
+            Some(client) => {
+                let dialer = ServerTcpDialer { context };
+                client
+                    .connect_tcp(&dialer, target_addr)
+                    .await
+                    .map(RemoteStream::Proxied)
+            }
+        }
+    })
+    .await
+    {
+        Ok(s) => s,
+        Err(err) => {
+            error!(
+                "tcp tunnel {} -> {} connect failed, error: {}",
+                peer_addr, target_addr, err
+            );
+            return Err(err);
+        }
+    };
+
+    // https://github.com/shadowsocks/shadowsocks-rust/issues/232
+    //
+    // Protocols like FTP, clients will wait for servers to send Welcome Message without sending anything.
+    //
+    // Wait at most 500ms, and then sends handshake packet to remote servers.
+    if let Some(packet) = first_packet {
+        // Sniffing has already waited for the first packet
+        if !packet.is_empty() {
+            timeout_fut(timeout, remote_stream.write_all(&packet)).await?;
+        } else if context.connect_opts_ref().tcp.fastopen {
+            timeout_fut(timeout, remote_stream.write(&[])).await?;
+        }
+    } else if context.connect_opts_ref().tcp.fastopen {
+        let mut buffer = [0u8; 8192];
+        match time::timeout(Duration::from_millis(500), stream.read(&mut buffer)).await {
+            Ok(Ok(0)) => {
+                // EOF. Just terminate right here.
+                return Ok(TcpConnect::Closed);
+            }
+            Ok(Ok(n)) => {
+                // Send the first packet.
+                timeout_fut(timeout, remote_stream.write_all(&buffer[..n])).await?;
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(..) => {
+                // Timeout. Send handshake to server.
+                timeout_fut(timeout, remote_stream.write(&[])).await?;
+
+                trace!(
+                    "tcp tunnel {} -> {} sent TFO connect without data",
+                    peer_addr, target_addr
+                );
+            }
+        }
+    }
+
+    Ok(TcpConnect::Connected(remote_stream))
 }

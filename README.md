@@ -949,6 +949,10 @@ Example configuration:
     // Accept sing-box compatible UDP over TCP (UoT v1 and v2) on the TCP listener
     "udp_over_tcp": false,
 
+    // ssserver only, see "Multiplex (sing-mux)"
+    // Accept sing-box compatible multiplex (h2mux, smux, yamux) on the TCP listener
+    "multiplex": false,
+
     // Balancer customization
     "balancer": {
         // MAX Round-Trip-Time (RTT) of servers
@@ -1220,6 +1224,66 @@ Notes:
 - UDP packets are sent directly from the server, not through `outbound_proxy`, the same as the UDP relay.
 - An idle UoT connection is closed after `udp_timeout` (default 5 minutes) without traffic in either direction.
 - Works with plugins and JLS transport, because UoT is handled after decryption.
+- Only `ssserver`, not `ssmanager`.
+
+### Multiplex (sing-mux)
+
+`ssserver` can accept multiplexed connections of sing-box and mihomo (sing-mux), which carry many TCP and UDP streams in one Shadowsocks TCP connection. A sing-mux session is a normal Shadowsocks TCP connection whose target is the magic domain name `sp.mux.sing-box.arpa`. All three protocols `h2mux`, `smux` and `yamux` are supported, with or without padding.
+
+```jsonc
+{
+    "server": "0.0.0.0",
+    "server_port": 8388,
+    "password": "password",
+    "method": "2022-blake3-aes-256-gcm",
+    // Or command line: --multiplex
+    "multiplex": true
+}
+```
+
+sing-box client outbound:
+
+```jsonc
+{
+    "type": "shadowsocks",
+    "server": "example.com",
+    "server_port": 8388,
+    "method": "2022-blake3-aes-256-gcm",
+    "password": "password",
+    "multiplex": {
+        "enabled": true,
+        "protocol": "h2mux", // or "smux", "yamux"
+        "padding": true
+    }
+}
+```
+
+mihomo (Clash.Meta) proxy:
+
+```yaml
+proxies:
+  - name: ss-mux
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: 2022-blake3-aes-256-gcm
+    password: password
+    udp: true
+    smux:
+      enabled: true
+      protocol: h2mux # or smux, yamux
+      padding: true
+```
+
+Notes:
+
+- Multiplex rides the TCP listener, so `mode` must be `tcp_only` or `tcp_and_udp`.
+- The target of each stream is checked against the ACL, the same as normal connections. The magic domain name itself is not subject to ACL or DNS.
+- TCP streams are handled like normal TCP connections, including `domain_sniff` and `outbound_proxy`.
+- UDP streams are sent directly from the server, not through `outbound_proxy`, and are closed after `udp_timeout` (default 5 minutes) without traffic, the same as "UDP over TCP".
+- A session carries at most 1024 concurrent streams.
+- TCP Brutal is not supported. Clients with `brutal` enabled are refused with "brutal is not enabled by the server".
+- Works with plugins and JLS transport, because multiplex is handled after decryption.
 - Only `ssserver`, not `ssmanager`.
 
 ### Environment Variables

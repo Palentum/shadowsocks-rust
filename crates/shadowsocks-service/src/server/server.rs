@@ -123,6 +123,11 @@ impl ServerBuilder {
         self.context.set_udp_over_tcp(udp_over_tcp);
     }
 
+    /// Set sing-box multiplex
+    pub fn set_multiplex(&mut self, multiplex: bool) {
+        self.context.set_multiplex(multiplex);
+    }
+
     /// Start the server
     ///
     /// 1. Starts plugin (subprocess), except JLS which runs in the TCP server

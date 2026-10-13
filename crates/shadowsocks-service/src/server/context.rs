@@ -38,6 +38,9 @@ pub struct ServiceContext {
     // sing-box UDP over TCP
     udp_over_tcp: bool,
 
+    // sing-box multiplex
+    multiplex: bool,
+
     // UDP association's expiry duration
     udp_expiry_duration: Duration,
 }
@@ -52,6 +55,7 @@ impl Default for ServiceContext {
             outbound_client: None,
             domain_sniff: DomainSniffConfig::default(),
             udp_over_tcp: false,
+            multiplex: false,
             udp_expiry_duration: crate::DEFAULT_UDP_EXPIRY_DURATION,
         }
     }
@@ -182,6 +186,16 @@ impl ServiceContext {
     /// Check if sing-box UDP over TCP is enabled
     pub fn udp_over_tcp(&self) -> bool {
         self.udp_over_tcp
+    }
+
+    /// Set sing-box multiplex
+    pub fn set_multiplex(&mut self, multiplex: bool) {
+        self.multiplex = multiplex;
+    }
+
+    /// Check if sing-box multiplex is enabled
+    pub fn multiplex(&self) -> bool {
+        self.multiplex
     }
 
     /// Set UDP association's expiry duration

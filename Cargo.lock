@@ -3449,6 +3449,7 @@ dependencies = [
  "etherparse",
  "flate2",
  "futures",
+ "h2",
  "hickory-resolver",
  "http",
  "http-body-util",
@@ -3481,6 +3482,8 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-rustls",
+ "tokio-util",
+ "tokio-yamux",
  "trait-variant",
  "tun",
  "url",
@@ -3948,6 +3951,20 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-yamux"
+version = "0.3.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1203db1ac9762aaf041ba62d4fade5959b89af1abd057c5e9bc54ae3e7f00c4b"
+dependencies = [
+ "bytes",
+ "futures",
+ "log",
+ "tokio",
+ "tokio-util",
+ "web-time",
 ]
 
 [[package]]

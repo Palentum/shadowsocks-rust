@@ -406,6 +406,9 @@ struct SSConfig {
     udp_over_tcp: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    multiplex: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     security: Option<SSSecurityConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1647,6 +1650,9 @@ pub struct Config {
     /// sing-box UDP over TCP of server
     pub udp_over_tcp: bool,
 
+    /// sing-box multiplex (sing-mux) of server
+    pub multiplex: bool,
+
     /// Balancer config of local server
     pub balancer: BalancerConfig,
 
@@ -1781,6 +1787,8 @@ impl Config {
             domain_sniff: DomainSniffConfig::default(),
 
             udp_over_tcp: false,
+
+            multiplex: false,
 
             balancer: BalancerConfig::default(),
 
@@ -2689,6 +2697,10 @@ impl Config {
             nconfig.udp_over_tcp = b;
         }
 
+        if let Some(b) = config.multiplex {
+            nconfig.multiplex = b;
+        }
+
         // Security
         if let Some(sec) = config.security
             && let Some(replay_attack) = sec.replay_attack
@@ -3501,6 +3513,10 @@ impl fmt::Display for Config {
             jconf.udp_over_tcp = Some(self.udp_over_tcp);
         }
 
+        if self.multiplex {
+            jconf.multiplex = Some(self.multiplex);
+        }
+
         // Security
         if self.security.replay_attack.policy != ReplayAttackPolicy::default() {
             jconf.security = Some(SSSecurityConfig {
@@ -3616,5 +3632,19 @@ mod tests {
 
         let config = Config::load_from_str(&config.to_string(), ConfigType::Server).unwrap();
         assert!(config.udp_over_tcp);
+    }
+
+    #[test]
+    fn multiplex_config() {
+        const SERVER: &str = r#""server": "127.0.0.1", "server_port": 8388, "password": "", "method": "none""#;
+        let load = |options: &str| Config::load_from_str(&format!("{{ {SERVER}{options} }}"), ConfigType::Server);
+
+        assert!(!load("").unwrap().multiplex);
+
+        let config = load(r#", "multiplex": true"#).unwrap();
+        assert!(config.multiplex);
+
+        let config = Config::load_from_str(&config.to_string(), ConfigType::Server).unwrap();
+        assert!(config.multiplex);
     }
 }

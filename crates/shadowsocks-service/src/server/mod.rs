@@ -19,6 +19,7 @@ pub use self::{
 };
 
 pub mod context;
+mod mux;
 #[allow(clippy::module_inception)]
 pub mod server;
 mod sniff;
@@ -121,6 +122,13 @@ pub async fn run(config: Config) -> io::Result<()> {
                 svr_cfg.mode()
             );
         }
+        if config.multiplex && !svr_cfg.mode().enable_tcp() {
+            log::warn!(
+                "multiplex requires TCP, server {} is in {} mode",
+                svr_cfg.addr(),
+                svr_cfg.mode()
+            );
+        }
         let mut server_builder = ServerBuilder::new(svr_cfg);
 
         if let Some(ref r) = resolver {
@@ -181,6 +189,10 @@ pub async fn run(config: Config) -> io::Result<()> {
                 log::warn!("udp_over_tcp traffic will bypass the outbound proxy chain");
             }
 
+            if config.multiplex {
+                log::warn!("multiplex UDP traffic will bypass the outbound proxy chain");
+            }
+
             server_builder.set_outbound_proxies(proxies);
         }
 
@@ -213,6 +225,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         server_builder.set_security_config(&config.security);
         server_builder.set_domain_sniff(config.domain_sniff);
         server_builder.set_udp_over_tcp(config.udp_over_tcp);
+        server_builder.set_multiplex(config.multiplex);
 
         let server = server_builder.build().await?;
         servers.push(server);

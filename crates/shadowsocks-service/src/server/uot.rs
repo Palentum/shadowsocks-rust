@@ -37,10 +37,30 @@ const MAGIC_ADDRESS: &str = "sp.v2.udp-over-tcp.arpa";
 /// Target address of legacy UoT v1 streams
 const LEGACY_MAGIC_ADDRESS: &str = "sp.udp-over-tcp.arpa";
 
-// Address types of packets, which are different from SOCKS5
-const ADDR_TYPE_IPV4: u8 = 0x00;
-const ADDR_TYPE_IPV6: u8 = 0x01;
-const ADDR_TYPE_DOMAIN_NAME: u8 = 0x02;
+/// Address types of packets, and the name in logs
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PacketFormat {
+    ipv4: u8,
+    ipv6: u8,
+    domain_name: u8,
+    label: &'static str,
+}
+
+/// UoT packets, whose address types are different from SOCKS5
+const UOT_FORMAT: PacketFormat = PacketFormat {
+    ipv4: 0x00,
+    ipv6: 0x01,
+    domain_name: 0x02,
+    label: "udp-over-tcp",
+};
+
+/// sing-mux UDP stream packets, with SOCKS5 address types
+pub(super) const MUX_FORMAT: PacketFormat = PacketFormat {
+    ipv4: 0x01,
+    ipv6: 0x04,
+    domain_name: 0x03,
+    label: "sing-mux udp",
+};
 
 /// Spare capacity reserved before each read, otherwise `BytesMut` grows by 64 bytes
 const READ_RESERVE_SIZE: usize = 16 * 1024;
@@ -61,20 +81,20 @@ pub fn uot_version(addr: &Address) -> Option<UotVersion> {
     }
 }
 
-/// Decode a UoT address, returns `None` if `buf` is incomplete
-fn decode_address(buf: &mut &[u8]) -> io::Result<Option<Address>> {
+/// Decode an address, returns `None` if `buf` is incomplete
+fn decode_address(buf: &mut &[u8], format: PacketFormat) -> io::Result<Option<Address>> {
     let addr_len = match buf.first() {
         None => return Ok(None),
-        Some(&ADDR_TYPE_IPV4) => 4,
-        Some(&ADDR_TYPE_IPV6) => 16,
-        Some(&ADDR_TYPE_DOMAIN_NAME) => match buf.get(1) {
+        Some(&t) if t == format.ipv4 => 4,
+        Some(&t) if t == format.ipv6 => 16,
+        Some(&t) if t == format.domain_name => match buf.get(1) {
             None => return Ok(None),
             Some(&n) => 1 + n as usize,
         },
         Some(&addr_type) => {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                format!("invalid udp-over-tcp address type {addr_type:#x}"),
+                format!("invalid {} address type {addr_type:#x}", format.label),
             ));
         }
     };
@@ -85,18 +105,18 @@ fn decode_address(buf: &mut &[u8]) -> io::Result<Option<Address>> {
     }
 
     let addr = match buf.get_u8() {
-        ADDR_TYPE_IPV4 => {
+        t if t == format.ipv4 => {
             let ip = Ipv4Addr::from(buf.get_u32());
             Address::SocketAddress(SocketAddr::new(ip.into(), buf.get_u16()))
         }
-        ADDR_TYPE_IPV6 => {
+        t if t == format.ipv6 => {
             let ip = Ipv6Addr::from(buf.get_u128());
             Address::SocketAddress(SocketAddr::new(ip.into(), buf.get_u16()))
         }
         _ => {
             let len = buf.get_u8() as usize;
             let name = str::from_utf8(&buf[..len])
-                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid udp-over-tcp domain name"))?
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, format!("invalid {} domain name", format.label)))?
                 .to_owned();
             buf.advance(len);
             Address::DomainNameAddress(name, buf.get_u16())
@@ -108,13 +128,17 @@ fn decode_address(buf: &mut &[u8]) -> io::Result<Option<Address>> {
 
 /// Decode a packet, returns the target address (non-connect mode) and the payload range in `buf`,
 /// or `None` if `buf` is incomplete
-fn decode_packet(buf: &[u8], connect: bool) -> io::Result<Option<(Option<Address>, Range<usize>)>> {
+fn decode_packet(
+    buf: &[u8],
+    connect: bool,
+    format: PacketFormat,
+) -> io::Result<Option<(Option<Address>, Range<usize>)>> {
     let mut rest = buf;
 
     let addr = if connect {
         None
     } else {
-        match decode_address(&mut rest)? {
+        match decode_address(&mut rest, format)? {
             None => return Ok(None),
             Some(addr) => Some(addr),
         }
@@ -144,18 +168,18 @@ fn unmap_ipv4(addr: SocketAddr) -> SocketAddr {
 }
 
 /// Encode a packet, with source address `addr` in non-connect mode
-fn encode_packet(buf: &mut BytesMut, addr: Option<SocketAddr>, payload: &[u8]) {
+fn encode_packet(buf: &mut BytesMut, addr: Option<SocketAddr>, payload: &[u8], format: PacketFormat) {
     if let Some(addr) = addr {
         // IPv4-mapped-IPv6 is sent back as IPv4
         let addr = unmap_ipv4(addr);
 
         match addr {
             SocketAddr::V4(ref v4) => {
-                buf.put_u8(ADDR_TYPE_IPV4);
+                buf.put_u8(format.ipv4);
                 buf.put_slice(&v4.ip().octets());
             }
             SocketAddr::V6(ref v6) => {
-                buf.put_u8(ADDR_TYPE_IPV6);
+                buf.put_u8(format.ipv6);
                 buf.put_slice(&v6.ip().octets());
             }
         }
@@ -203,40 +227,69 @@ where
         }
     };
 
-    if let Some(ref addr) = connect_addr
-        && context.check_outbound_blocked(addr).await
-    {
-        error!(
-            "udp-over-tcp client {} outbound {} blocked by ACL rules",
-            peer_addr, addr
-        );
-        return Ok(());
-    }
-
-    // Resolve the target of connect mode only once, it can't be changed by DNS after the ACL check
     let connect_addr = match connect_addr {
         None => None,
-        Some(Address::SocketAddress(sa)) => Some(unmap_ipv4(sa)),
-        Some(Address::DomainNameAddress(ref dname, port)) => {
-            match async { lookup_then!(context.context_ref(), dname, port, |sa| { io::Result::Ok(()) }) }.await {
-                Ok((sa, ..)) => Some(unmap_ipv4(sa)),
-                Err(err) => {
-                    error!(
-                        "udp-over-tcp client {} resolve {}:{} failed, error: {}",
-                        peer_addr, dname, port, err
-                    );
-                    return Ok(());
-                }
-            }
-        }
+        Some(ref addr) => match resolve_connect_target(&context, peer_addr, addr, UOT_FORMAT).await {
+            Ok(Some(sa)) => Some(sa),
+            Ok(None) | Err(..) => return Ok(()),
+        },
     };
-    let connect_target = connect_addr.map(Address::SocketAddress);
 
     debug!(
         "established udp-over-tcp {:?} tunnel {}, connect: {:?}",
         version, peer_addr, connect_addr
     );
 
+    relay(&context, peer_addr, stream, connect_addr, UOT_FORMAT).await
+}
+
+/// Check the target of connect mode by ACL, and resolve it only once,
+/// so it can't be changed by DNS after the ACL check. Returns `None` if it is blocked.
+pub(super) async fn resolve_connect_target(
+    context: &ServiceContext,
+    peer_addr: SocketAddr,
+    addr: &Address,
+    format: PacketFormat,
+) -> io::Result<Option<SocketAddr>> {
+    if context.check_outbound_blocked(addr).await {
+        error!(
+            "{} client {} outbound {} blocked by ACL rules",
+            format.label, peer_addr, addr
+        );
+        return Ok(None);
+    }
+
+    match *addr {
+        Address::SocketAddress(sa) => Ok(Some(unmap_ipv4(sa))),
+        Address::DomainNameAddress(ref dname, port) => {
+            match async { lookup_then!(context.context_ref(), dname, port, |sa| { io::Result::Ok(()) }) }.await {
+                Ok((sa, ..)) => Ok(Some(unmap_ipv4(sa))),
+                Err(err) => {
+                    error!(
+                        "{} client {} resolve {}:{} failed, error: {}",
+                        format.label, peer_addr, dname, port, err
+                    );
+                    Err(err)
+                }
+            }
+        }
+    }
+}
+
+/// Relay packets of `stream` until EOF, error or idle for `udp_expiry_duration`.
+/// Packets are sent to `connect_addr` in connect mode.
+pub(super) async fn relay<S>(
+    context: &ServiceContext,
+    peer_addr: SocketAddr,
+    mut stream: S,
+    connect_addr: Option<SocketAddr>,
+    format: PacketFormat,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let udp_expiry = context.udp_expiry_duration();
+    let connect_target = connect_addr.map(Address::SocketAddress);
     let connect = connect_addr.is_some();
 
     let mut read_buffer = BytesMut::new();
@@ -256,7 +309,8 @@ where
                 if read_result? == 0 {
                     if !read_buffer.is_empty() {
                         debug!(
-                            "udp-over-tcp client {} closed with {} bytes of incomplete packet",
+                            "{} client {} closed with {} bytes of incomplete packet",
+                            format.label,
                             peer_addr,
                             read_buffer.len()
                         );
@@ -266,26 +320,26 @@ where
                 reset_timer(idle_timer.as_mut(), udp_expiry);
 
                 let mut offset = 0;
-                while let Some((addr, payload)) = decode_packet(&read_buffer[offset..], connect)? {
+                while let Some((addr, payload)) = decode_packet(&read_buffer[offset..], connect, format)? {
                     let data = &read_buffer[offset + payload.start..offset + payload.end];
                     offset += payload.end;
 
                     let target_addr = match (&addr, &connect_target) {
                         (Some(addr), _) => {
                             if context.check_outbound_blocked(addr).await {
-                                warn!("udp-over-tcp client {} outbound {} blocked by ACL rules", peer_addr, addr);
+                                warn!("{} client {} outbound {} blocked by ACL rules", format.label, peer_addr, addr);
                                 continue;
                             }
                             addr
                         }
                         (None, Some(addr)) => addr,
-                        (None, None) => unreachable!("udp-over-tcp packet without target address"),
+                        (None, None) => unreachable!("{} packet without target address", format.label),
                     };
 
-                    trace!("udp-over-tcp relay {} -> {} with {} bytes", peer_addr, target_addr, data.len());
+                    trace!("{} relay {} -> {} with {} bytes", format.label, peer_addr, target_addr, data.len());
 
                     if let Err(err) = send_outbound_packet(
-                        &context,
+                        context,
                         peer_addr,
                         &mut outbound_ipv4_socket,
                         &mut outbound_ipv6_socket,
@@ -295,7 +349,8 @@ where
                     .await
                     {
                         error!(
-                            "udp-over-tcp relay {} -> {} with {} bytes, error: {}",
+                            "{} relay {} -> {} with {} bytes, error: {}",
+                            format.label,
                             peer_addr,
                             target_addr,
                             data.len(),
@@ -310,7 +365,7 @@ where
                 let (n, addr) = match received_opt {
                     Ok(r) => r,
                     Err(err) => {
-                        error!("udp-over-tcp relay {} <- ... failed, error: {}", peer_addr, err);
+                        error!("{} relay {} <- ... failed, error: {}", format.label, peer_addr, err);
                         // Socket failure. Reset for recreation.
                         outbound_ipv4_socket = None;
                         continue;
@@ -318,12 +373,12 @@ where
                 };
 
                 if !is_expected_source(connect_addr, addr) {
-                    trace!("udp-over-tcp relay {} <- {} dropped, expecting {:?}", peer_addr, addr, connect_addr);
+                    trace!("{} relay {} <- {} dropped, expecting {:?}", format.label, peer_addr, addr, connect_addr);
                     continue;
                 }
 
                 let data = &outbound_ipv4_buffer[..n];
-                send_back_packet(&mut stream, &mut write_buffer, peer_addr, (!connect).then_some(addr), data, udp_expiry).await?;
+                send_back_packet(&mut stream, &mut write_buffer, peer_addr, (!connect).then_some(addr), data, format, udp_expiry).await?;
                 reset_timer(idle_timer.as_mut(), udp_expiry);
             }
 
@@ -331,7 +386,7 @@ where
                 let (n, addr) = match received_opt {
                     Ok(r) => r,
                     Err(err) => {
-                        error!("udp-over-tcp relay {} <- ... failed, error: {}", peer_addr, err);
+                        error!("{} relay {} <- ... failed, error: {}", format.label, peer_addr, err);
                         // Socket failure. Reset for recreation.
                         outbound_ipv6_socket = None;
                         continue;
@@ -339,17 +394,17 @@ where
                 };
 
                 if !is_expected_source(connect_addr, addr) {
-                    trace!("udp-over-tcp relay {} <- {} dropped, expecting {:?}", peer_addr, addr, connect_addr);
+                    trace!("{} relay {} <- {} dropped, expecting {:?}", format.label, peer_addr, addr, connect_addr);
                     continue;
                 }
 
                 let data = &outbound_ipv6_buffer[..n];
-                send_back_packet(&mut stream, &mut write_buffer, peer_addr, (!connect).then_some(addr), data, udp_expiry).await?;
+                send_back_packet(&mut stream, &mut write_buffer, peer_addr, (!connect).then_some(addr), data, format, udp_expiry).await?;
                 reset_timer(idle_timer.as_mut(), udp_expiry);
             }
 
             _ = &mut idle_timer => {
-                debug!("udp-over-tcp tunnel {} idle timeout", peer_addr);
+                debug!("{} tunnel {} idle timeout", format.label, peer_addr);
                 break;
             }
         }
@@ -358,7 +413,7 @@ where
     // Notify the client (JLS close_notify), which may block if the client doesn't read
     let _ = time::timeout(udp_expiry, stream.shutdown()).await;
 
-    debug!("udp-over-tcp tunnel {} closed", peer_addr);
+    debug!("{} tunnel {} closed", format.label, peer_addr);
     Ok(())
 }
 
@@ -380,12 +435,14 @@ fn is_expected_source(connect_addr: Option<SocketAddr>, addr: SocketAddr) -> boo
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_back_packet<S>(
     stream: &mut S,
     buffer: &mut BytesMut,
     peer_addr: SocketAddr,
     addr: Option<SocketAddr>,
     data: &[u8],
+    format: PacketFormat,
     timeout: Duration,
 ) -> io::Result<()>
 where
@@ -393,7 +450,8 @@ where
 {
     if data.len() > u16::MAX as usize {
         warn!(
-            "udp-over-tcp failed to send back {} bytes to client {}, packet too large",
+            "{} failed to send back {} bytes to client {}, packet too large",
+            format.label,
             data.len(),
             peer_addr
         );
@@ -401,7 +459,7 @@ where
     }
 
     buffer.clear();
-    encode_packet(buffer, addr, data);
+    encode_packet(buffer, addr, data, format);
 
     // Flush is required, JLS keeps data in TLS buffer until flushed
     match time::timeout(timeout, async {
@@ -450,7 +508,7 @@ mod test {
     fn decode_packets() {
         // 8.8.8.8:53, AA BB CC
         let buf = [0x00, 8, 8, 8, 8, 0x00, 0x35, 0x00, 0x03, 0xAA, 0xBB, 0xCC, 0xFF];
-        let (addr, payload) = decode_packet(&buf, false).unwrap().unwrap();
+        let (addr, payload) = decode_packet(&buf, false, UOT_FORMAT).unwrap().unwrap();
         assert_eq!(addr, Some(Address::SocketAddress("8.8.8.8:53".parse().unwrap())));
         assert_eq!(&buf[payload], &[0xAA, 0xBB, 0xCC]);
 
@@ -458,7 +516,7 @@ mod test {
         let mut buf = vec![0x01];
         buf.extend_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
         buf.extend_from_slice(&[0x01, 0xBB, 0x00, 0x00]);
-        let (addr, payload) = decode_packet(&buf, false).unwrap().unwrap();
+        let (addr, payload) = decode_packet(&buf, false, UOT_FORMAT).unwrap().unwrap();
         assert_eq!(addr, Some(Address::SocketAddress("[2001:db8::1]:443".parse().unwrap())));
         assert!(payload.is_empty());
         assert_eq!(payload.end, buf.len());
@@ -467,13 +525,13 @@ mod test {
         let mut buf = vec![0x02, 11];
         buf.extend_from_slice(b"example.com");
         buf.extend_from_slice(&[0x00, 0x50, 0x00, 0x01, 0x42]);
-        let (addr, payload) = decode_packet(&buf, false).unwrap().unwrap();
+        let (addr, payload) = decode_packet(&buf, false, UOT_FORMAT).unwrap().unwrap();
         assert_eq!(addr, Some(Address::DomainNameAddress("example.com".to_owned(), 80)));
         assert_eq!(&buf[payload], &[0x42]);
 
         // connect mode
         let buf = [0x00, 0x02, 0x11, 0x22];
-        let (addr, payload) = decode_packet(&buf, true).unwrap().unwrap();
+        let (addr, payload) = decode_packet(&buf, true, UOT_FORMAT).unwrap().unwrap();
         assert_eq!(addr, None);
         assert_eq!(&buf[payload], &[0x11, 0x22]);
     }
@@ -492,24 +550,29 @@ mod test {
 
         for (packet, connect) in packets {
             for n in 0..packet.len() {
-                assert!(decode_packet(&packet[..n], connect).unwrap().is_none());
+                assert!(decode_packet(&packet[..n], connect, UOT_FORMAT).unwrap().is_none());
             }
-            assert!(decode_packet(packet, connect).unwrap().is_some());
+            assert!(decode_packet(packet, connect, UOT_FORMAT).unwrap().is_some());
         }
     }
 
     #[test]
     fn decode_invalid_packets() {
         // SOCKS5 IPv6 address type
-        assert!(decode_packet(&[0x04, 0, 0, 0, 0], false).is_err());
+        assert!(decode_packet(&[0x04, 0, 0, 0, 0], false, UOT_FORMAT).is_err());
         // Invalid UTF-8
-        assert!(decode_packet(&[0x02, 0x01, 0xFF, 0x00, 0x50, 0x00, 0x00], false).is_err());
+        assert!(decode_packet(&[0x02, 0x01, 0xFF, 0x00, 0x50, 0x00, 0x00], false, UOT_FORMAT).is_err());
     }
 
     #[test]
     fn encode_packets() {
         let mut buf = BytesMut::new();
-        encode_packet(&mut buf, Some("8.8.8.8:53".parse().unwrap()), &[0x11, 0x22, 0x33, 0x44]);
+        encode_packet(
+            &mut buf,
+            Some("8.8.8.8:53".parse().unwrap()),
+            &[0x11, 0x22, 0x33, 0x44],
+            UOT_FORMAT,
+        );
         assert_eq!(
             &buf[..],
             &[0x00, 8, 8, 8, 8, 0x00, 0x35, 0x00, 0x04, 0x11, 0x22, 0x33, 0x44]
@@ -518,19 +581,56 @@ mod test {
         // IPv4-mapped-IPv6 is sent back as IPv4
         buf.clear();
         let mapped = SocketAddrV6::new(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped(), 53, 0, 0);
-        encode_packet(&mut buf, Some(mapped.into()), &[]);
+        encode_packet(&mut buf, Some(mapped.into()), &[], UOT_FORMAT);
         assert_eq!(&buf[..], &[0x00, 1, 2, 3, 4, 0x00, 0x35, 0x00, 0x00]);
 
         buf.clear();
-        encode_packet(&mut buf, Some("[2001:db8::1]:443".parse().unwrap()), &[0x42]);
-        let (addr, payload) = decode_packet(&buf, false).unwrap().unwrap();
+        encode_packet(
+            &mut buf,
+            Some("[2001:db8::1]:443".parse().unwrap()),
+            &[0x42],
+            UOT_FORMAT,
+        );
+        let (addr, payload) = decode_packet(&buf, false, UOT_FORMAT).unwrap().unwrap();
         assert_eq!(addr, Some(Address::SocketAddress("[2001:db8::1]:443".parse().unwrap())));
         assert_eq!(&buf[payload], &[0x42]);
 
         // connect mode
         buf.clear();
-        encode_packet(&mut buf, None, &[0x11, 0x22]);
+        encode_packet(&mut buf, None, &[0x11, 0x22], UOT_FORMAT);
         assert_eq!(&buf[..], &[0x00, 0x02, 0x11, 0x22]);
+    }
+
+    #[test]
+    fn socks5_format_packets() {
+        // 8.8.8.8:53, AA BB
+        let buf = [0x01, 8, 8, 8, 8, 0x00, 0x35, 0x00, 0x02, 0xAA, 0xBB];
+        let (addr, payload) = decode_packet(&buf, false, MUX_FORMAT).unwrap().unwrap();
+        assert_eq!(addr, Some(Address::SocketAddress("8.8.8.8:53".parse().unwrap())));
+        assert_eq!(&buf[payload], &[0xAA, 0xBB]);
+
+        // example.com:80, same as a SOCKS5 address
+        let mut buf = BytesMut::new();
+        Address::DomainNameAddress("example.com".to_owned(), 80).write_to_buf(&mut buf);
+        buf.put_slice(&[0x00, 0x01, 0x42]);
+        let (addr, payload) = decode_packet(&buf, false, MUX_FORMAT).unwrap().unwrap();
+        assert_eq!(addr, Some(Address::DomainNameAddress("example.com".to_owned(), 80)));
+        assert_eq!(&buf[payload], &[0x42]);
+
+        // UoT IPv4 address type is invalid
+        assert!(decode_packet(&[0x00, 8, 8, 8, 8, 0x00, 0x35, 0x00, 0x00], false, MUX_FORMAT).is_err());
+
+        let mut buf = BytesMut::new();
+        encode_packet(
+            &mut buf,
+            Some("[2001:db8::1]:443".parse().unwrap()),
+            &[0x42],
+            MUX_FORMAT,
+        );
+        let mut expected = BytesMut::new();
+        Address::SocketAddress("[2001:db8::1]:443".parse().unwrap()).write_to_buf(&mut expected);
+        expected.put_slice(&[0x00, 0x01, 0x42]);
+        assert_eq!(buf, expected);
     }
 
     /// UDP echo server, returns its address
@@ -567,7 +667,7 @@ mod test {
         } else {
             let mut ipv4 = [0u8; 7];
             stream.read_exact(&mut ipv4).await.unwrap();
-            assert_eq!(ipv4[0], ADDR_TYPE_IPV4);
+            assert_eq!(ipv4[0], UOT_FORMAT.ipv4);
             let ip = Ipv4Addr::new(ipv4[1], ipv4[2], ipv4[3], ipv4[4]);
             Some(SocketAddr::new(ip.into(), u16::from_be_bytes([ipv4[5], ipv4[6]])))
         };
@@ -597,8 +697,8 @@ mod test {
         let mut data = vec![0x00];
         data.extend(encode_socks5_addr(echo_addr));
         let mut packets = BytesMut::new();
-        encode_packet(&mut packets, Some(echo_addr), b"hello");
-        encode_packet(&mut packets, Some(echo_addr), b"");
+        encode_packet(&mut packets, Some(echo_addr), b"hello", UOT_FORMAT);
+        encode_packet(&mut packets, Some(echo_addr), b"", UOT_FORMAT);
         data.extend_from_slice(&packets);
         write_bytewise(&mut client, &data).await;
 
@@ -611,7 +711,7 @@ mod test {
         // Large packet, written at once
         let payload = vec![0x5A; 20000];
         packets.clear();
-        encode_packet(&mut packets, Some(echo_addr), &payload);
+        encode_packet(&mut packets, Some(echo_addr), &payload, UOT_FORMAT);
         client.write_all(&packets).await.unwrap();
         assert_eq!(read_packet(&mut client, false).await, (Some(echo_addr), payload));
     }
@@ -624,7 +724,7 @@ mod test {
         let mut data = vec![0x01];
         data.extend(encode_socks5_addr(echo_addr));
         let mut packets = BytesMut::new();
-        encode_packet(&mut packets, None, b"hello");
+        encode_packet(&mut packets, None, b"hello", UOT_FORMAT);
         data.extend_from_slice(&packets);
         write_bytewise(&mut client, &data).await;
 
@@ -641,7 +741,7 @@ mod test {
         Address::DomainNameAddress("localhost".to_owned(), echo_addr.port()).write_to_buf(&mut addr);
         data.extend_from_slice(&addr);
         let mut packets = BytesMut::new();
-        encode_packet(&mut packets, None, b"hello");
+        encode_packet(&mut packets, None, b"hello", UOT_FORMAT);
         data.extend_from_slice(&packets);
         client.write_all(&data).await.unwrap();
 
@@ -669,7 +769,7 @@ mod test {
         let mut data = vec![0x01];
         data.extend(encode_socks5_addr(echo_addr));
         let mut packets = BytesMut::new();
-        encode_packet(&mut packets, None, b"hello");
+        encode_packet(&mut packets, None, b"hello", UOT_FORMAT);
         data.extend_from_slice(&packets);
         client.write_all(&data).await.unwrap();
 
@@ -684,7 +784,7 @@ mod test {
         let mut client = start_server_with_context(context, UotVersion::V1);
 
         let mut packets = BytesMut::new();
-        encode_packet(&mut packets, Some(echo_addr), b"hello");
+        encode_packet(&mut packets, Some(echo_addr), b"hello", UOT_FORMAT);
         client.write_all(&packets).await.unwrap();
 
         assert_eq!(
@@ -699,8 +799,8 @@ mod test {
         let mut client = start_server(UotVersion::V1);
 
         let mut packets = BytesMut::new();
-        encode_packet(&mut packets, Some(echo_addr), b"hello");
-        encode_packet(&mut packets, Some(echo_addr), b"world");
+        encode_packet(&mut packets, Some(echo_addr), b"hello", UOT_FORMAT);
+        encode_packet(&mut packets, Some(echo_addr), b"world", UOT_FORMAT);
         client.write_all(&packets).await.unwrap();
 
         assert_eq!(
@@ -731,7 +831,7 @@ mod test {
         let mut client = start_server(UotVersion::V1);
 
         let mut packets = BytesMut::new();
-        encode_packet(&mut packets, Some(echo_addr), b"hello");
+        encode_packet(&mut packets, Some(echo_addr), b"hello", UOT_FORMAT);
         client.write_all(&packets).await.unwrap();
         assert_eq!(
             read_packet(&mut client, false).await,
