@@ -357,7 +357,12 @@ impl TcpServerClient {
         // sing-box multiplex, streams' targets are checked by ACL instead of the magic address
         if self.context.multiplex() && mux::is_mux_address(&target_addr) {
             self.set_nodelay();
-            return mux::serve(self.context, self.peer_addr, self.stream, self.timeout).await;
+            let brutal = self
+                .context
+                .multiplex_brutal()
+                .map(|config| mux::Brutal::new(config, self.stream.get_ref().get_ref().get_ref()))
+                .transpose()?;
+            return mux::serve(self.context, self.peer_addr, self.stream, brutal, self.timeout).await;
         }
 
         let mut remote_stream = match connect_target(

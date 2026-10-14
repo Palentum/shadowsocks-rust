@@ -952,6 +952,9 @@ Example configuration:
     // ssserver only, see "Multiplex (sing-mux)"
     // Accept sing-box compatible multiplex (h2mux, smux, yamux) on the TCP listener
     "multiplex": false,
+    // ssserver only, see "TCP Brutal" of "Multiplex (sing-mux)"
+    // Enable TCP Brutal of multiplex sessions, bandwidth in Mbps, Linux only
+    // "multiplex_brutal": { "up_mbps": 100, "down_mbps": 100 },
 
     // Balancer customization
     "balancer": {
@@ -1282,9 +1285,63 @@ Notes:
 - TCP streams are handled like normal TCP connections, including `domain_sniff` and `outbound_proxy`.
 - UDP streams are sent directly from the server, not through `outbound_proxy`, and are closed after `udp_timeout` (default 5 minutes) without traffic, the same as "UDP over TCP".
 - A session carries at most 1024 concurrent streams.
-- TCP Brutal is not supported. Clients with `brutal` enabled are refused with "brutal is not enabled by the server".
+- TCP Brutal is supported with `multiplex_brutal`, see below. Without it, clients with `brutal` enabled are refused with "brutal is not enabled by the server".
 - Works with plugins and JLS transport, because multiplex is handled after decryption.
 - Only `ssserver`, not `ssmanager`.
+
+#### TCP Brutal
+
+With `multiplex_brutal`, `ssserver` accepts the bandwidth exchange of sing-mux clients with `brutal` enabled, and sets the congestion control of the session's TCP connection to [TCP Brutal](https://github.com/apernet/tcp-brutal), which sends at a fixed rate regardless of packet loss.
+
+```jsonc
+{
+    "server": "0.0.0.0",
+    "server_port": 8388,
+    "password": "password",
+    "method": "2022-blake3-aes-256-gcm",
+    "multiplex": true,
+    // Or command line: --multiplex-brutal-up-mbps 100 --multiplex-brutal-down-mbps 100
+    "multiplex_brutal": {
+        // Sending bandwidth of the server (download of clients) in Mbps
+        "up_mbps": 100,
+        // Receiving bandwidth of the server (upload of clients) in Mbps
+        "down_mbps": 100
+    }
+}
+```
+
+sing-box client outbound:
+
+```jsonc
+"multiplex": {
+    "enabled": true,
+    "protocol": "h2mux",
+    "brutal": {
+        "enabled": true,
+        "up_mbps": 50,
+        "down_mbps": 100
+    }
+}
+```
+
+mihomo (Clash.Meta) proxy:
+
+```yaml
+smux:
+  enabled: true
+  protocol: h2mux
+  brutal-opts:
+    enabled: true
+    up: 50
+    down: 100
+```
+
+Notes:
+
+- Linux only. The [tcp-brutal](https://github.com/apernet/tcp-brutal) kernel module must be installed. A non-root `ssserver` also needs `CAP_NET_ADMIN`, or `brutal` in `net.ipv4.tcp_allowed_congestion_control`.
+- The server sends at the smaller one of its `up_mbps` and the client's `down_mbps`. The client is told the server's `down_mbps`, and sends at the smaller one of that and its own `up_mbps`.
+- If the congestion control can't be set, the client receives "enable TCP Brutal: ..." and closes the session.
+- Not supported with SIP003 plugins (JLS is fine), whose connections to `ssserver` are loopback ones, or with MPTCP (`mptcp`), whose sockets don't support the parameters of TCP Brutal. `multiplex_brutal` is disabled for such servers with a warning, and clients are refused with "brutal is not enabled by the server".
 
 ### Environment Variables
 

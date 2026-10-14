@@ -409,6 +409,9 @@ struct SSConfig {
     multiplex: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    multiplex_brutal: Option<MultiplexBrutalConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     security: Option<SSSecurityConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1455,6 +1458,17 @@ impl DomainSniffConfig {
     }
 }
 
+/// TCP Brutal of the server's sing-box multiplex sessions
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+// Enabled by presence, `"enabled": false` of sing-box must not be ignored
+#[serde(deny_unknown_fields)]
+pub struct MultiplexBrutalConfig {
+    /// Sending bandwidth in Mbps
+    pub up_mbps: u64,
+    /// Receiving bandwidth in Mbps
+    pub down_mbps: u64,
+}
+
 /// Balancer Config
 #[derive(Clone, Debug, Default)]
 pub struct BalancerConfig {
@@ -1653,6 +1667,9 @@ pub struct Config {
     /// sing-box multiplex (sing-mux) of server
     pub multiplex: bool,
 
+    /// TCP Brutal of server's sing-box multiplex
+    pub multiplex_brutal: Option<MultiplexBrutalConfig>,
+
     /// Balancer config of local server
     pub balancer: BalancerConfig,
 
@@ -1789,6 +1806,7 @@ impl Config {
             udp_over_tcp: false,
 
             multiplex: false,
+            multiplex_brutal: None,
 
             balancer: BalancerConfig::default(),
 
@@ -2701,6 +2719,8 @@ impl Config {
             nconfig.multiplex = b;
         }
 
+        nconfig.multiplex_brutal = config.multiplex_brutal;
+
         // Security
         if let Some(sec) = config.security
             && let Some(replay_attack) = sec.replay_attack
@@ -2973,6 +2993,24 @@ impl Config {
         if self.config_type.is_server() && self.domain_sniff.redirect && !self.domain_sniff.is_enabled() {
             let err = Error::new(ErrorKind::Invalid, "sniff_redirect requires domain_sniff", None);
             return Err(err);
+        }
+
+        if self.config_type.is_server()
+            && let Some(brutal) = self.multiplex_brutal
+        {
+            let reason = if !self.multiplex {
+                Some("multiplex_brutal requires multiplex")
+            } else if brutal.up_mbps == 0 || brutal.down_mbps == 0 {
+                Some("multiplex_brutal.up_mbps and multiplex_brutal.down_mbps must be > 0")
+            } else if !cfg!(any(target_os = "linux", target_os = "android")) {
+                Some("multiplex_brutal (TCP Brutal) is only supported on Linux")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                let err = Error::new(ErrorKind::Invalid, reason, None);
+                return Err(err);
+            }
         }
 
         #[cfg(feature = "local-online-config")]
@@ -3517,6 +3555,8 @@ impl fmt::Display for Config {
             jconf.multiplex = Some(self.multiplex);
         }
 
+        jconf.multiplex_brutal = self.multiplex_brutal;
+
         // Security
         if self.security.replay_attack.policy != ReplayAttackPolicy::default() {
             jconf.security = Some(SSSecurityConfig {
@@ -3578,7 +3618,7 @@ pub fn read_variable_field_value(value: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigType, DomainSniffConfig, OutboundProxy};
+    use super::{Config, ConfigType, DomainSniffConfig, MultiplexBrutalConfig, OutboundProxy};
 
     #[test]
     fn outbound_proxy_url_without_auth() {
@@ -3646,5 +3686,40 @@ mod tests {
 
         let config = Config::load_from_str(&config.to_string(), ConfigType::Server).unwrap();
         assert!(config.multiplex);
+    }
+
+    #[test]
+    fn multiplex_brutal_config() {
+        const SERVER: &str = r#""server": "127.0.0.1", "server_port": 8388, "password": "", "method": "none""#;
+        let load = |options: &str| Config::load_from_str(&format!("{{ {SERVER}{options} }}"), ConfigType::Server);
+        let brutal = MultiplexBrutalConfig {
+            up_mbps: 100,
+            down_mbps: 200,
+        };
+
+        assert_eq!(load("").unwrap().multiplex_brutal, None);
+
+        let config = load(r#", "multiplex": true, "multiplex_brutal": {"up_mbps": 100, "down_mbps": 200}"#).unwrap();
+        assert_eq!(config.multiplex_brutal, Some(brutal));
+        assert_eq!(
+            config.check_integrity().is_ok(),
+            cfg!(any(target_os = "linux", target_os = "android"))
+        );
+
+        let config = Config::load_from_str(&config.to_string(), ConfigType::Server).unwrap();
+        assert_eq!(config.multiplex_brutal, Some(brutal));
+
+        for invalid in [
+            r#", "multiplex_brutal": {"up_mbps": 100, "down_mbps": 200}"#,
+            r#", "multiplex": true, "multiplex_brutal": {"up_mbps": 0, "down_mbps": 200}"#,
+            r#", "multiplex": true, "multiplex_brutal": {"up_mbps": 100, "down_mbps": 0}"#,
+        ] {
+            assert!(load(invalid).unwrap().check_integrity().is_err(), "{invalid}");
+        }
+        assert!(load(r#", "multiplex": true, "multiplex_brutal": {"up_mbps": 100}"#).is_err());
+        assert!(
+            load(r#", "multiplex": true, "multiplex_brutal": {"enabled": false, "up_mbps": 100, "down_mbps": 200}"#)
+                .is_err()
+        );
     }
 }

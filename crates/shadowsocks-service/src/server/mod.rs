@@ -9,6 +9,7 @@ use shadowsocks::net::{AcceptOpts, ConnectOpts, UdpSocketOpts};
 use crate::{
     config::{Config, ConfigType},
     dns::build_dns_resolver,
+    net::jls::is_jls_plugin,
     utils::ServerHandle,
 };
 
@@ -129,6 +130,24 @@ pub async fn run(config: Config) -> io::Result<()> {
                 svr_cfg.mode()
             );
         }
+        // TCP Brutal is set on accepted sockets, which are loopback connections from SIP003 plugins,
+        // and MPTCP sockets don't support its parameters
+        let mut multiplex_brutal = config.multiplex_brutal;
+        if multiplex_brutal.is_some() {
+            let unsupported = match svr_cfg.plugin() {
+                Some(plugin) if plugin.plugin_mode.enable_tcp() && !is_jls_plugin(plugin) => Some("SIP003 plugins"),
+                _ if config.mptcp => Some("MPTCP"),
+                _ => None,
+            };
+            if let Some(unsupported) = unsupported {
+                log::warn!(
+                    "multiplex_brutal is disabled for server {}, TCP Brutal is not supported with {}",
+                    svr_cfg.addr(),
+                    unsupported
+                );
+                multiplex_brutal = None;
+            }
+        }
         let mut server_builder = ServerBuilder::new(svr_cfg);
 
         if let Some(ref r) = resolver {
@@ -226,6 +245,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         server_builder.set_domain_sniff(config.domain_sniff);
         server_builder.set_udp_over_tcp(config.udp_over_tcp);
         server_builder.set_multiplex(config.multiplex);
+        server_builder.set_multiplex_brutal(multiplex_brutal);
 
         let server = server_builder.build().await?;
         servers.push(server);

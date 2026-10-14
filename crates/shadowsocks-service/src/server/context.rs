@@ -13,7 +13,7 @@ use shadowsocks::{
 use crate::config::OutboundProxy;
 use crate::{
     acl::AccessControl,
-    config::{DomainSniffConfig, SecurityConfig},
+    config::{DomainSniffConfig, MultiplexBrutalConfig, SecurityConfig},
     net::{FlowStat, OutboundProxyClient},
 };
 
@@ -41,6 +41,9 @@ pub struct ServiceContext {
     // sing-box multiplex
     multiplex: bool,
 
+    // TCP Brutal of sing-box multiplex
+    multiplex_brutal: Option<MultiplexBrutalConfig>,
+
     // UDP association's expiry duration
     udp_expiry_duration: Duration,
 }
@@ -56,6 +59,7 @@ impl Default for ServiceContext {
             domain_sniff: DomainSniffConfig::default(),
             udp_over_tcp: false,
             multiplex: false,
+            multiplex_brutal: None,
             udp_expiry_duration: crate::DEFAULT_UDP_EXPIRY_DURATION,
         }
     }
@@ -196,6 +200,16 @@ impl ServiceContext {
     /// Check if sing-box multiplex is enabled
     pub fn multiplex(&self) -> bool {
         self.multiplex
+    }
+
+    /// Set TCP Brutal of sing-box multiplex
+    pub fn set_multiplex_brutal(&mut self, brutal: Option<MultiplexBrutalConfig>) {
+        self.multiplex_brutal = brutal;
+    }
+
+    /// Get TCP Brutal of sing-box multiplex, `None` if disabled
+    pub fn multiplex_brutal(&self) -> Option<MultiplexBrutalConfig> {
+        self.multiplex_brutal
     }
 
     /// Set UDP association's expiry duration

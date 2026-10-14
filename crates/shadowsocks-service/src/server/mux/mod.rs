@@ -9,15 +9,28 @@
 //!
 //! UDP streams are packets `[length u16][payload]` to the requested address,
 //! or `[SOCKS5 address][length u16][payload]` if the address flag is set.
+//!
+//! TCP Brutal is negotiated by a stream to `_BrutalBwExchange` with the client's receiving bandwidth `[u64]`,
+//! which is responded after the status with `[0x01][server's receiving bandwidth u64]`,
+//! or `[0x00][message length uvarint][message]` on failure.
 
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use shadowsocks::relay::socks5::Address;
+use socket2::{SockRef, Socket};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes},
-    task::JoinSet,
+    net::TcpStream,
+    task::{self, JoinSet},
 };
+
+use crate::config::MultiplexBrutalConfig;
 
 use super::{
     context::ServiceContext,
@@ -58,6 +71,29 @@ const STATUS_ERROR: u8 = 0x01;
 const BRUTAL_EXCHANGE_DOMAIN: &str = "_BrutalBwExchange";
 /// Response of TCP Brutal bandwidth exchanges: status, not OK, and the message
 const BRUTAL_NOT_ENABLED: &[u8] = b"\x00\x00\x23brutal is not enabled by the server";
+/// Bytes per second of 1 Mbps
+const MBPS_TO_BPS: u64 = 125_000;
+
+/// TCP Brutal of a session
+pub(super) struct Brutal {
+    /// Maximum sending bandwidth in bytes per second
+    send_bps: u64,
+    /// Receiving bandwidth in bytes per second
+    receive_bps: u64,
+    /// Duplicate of the session's socket, which may be closed while stream tasks are still running
+    socket: Socket,
+}
+
+impl Brutal {
+    /// TCP Brutal of the session on `stream`
+    pub(super) fn new(config: MultiplexBrutalConfig, stream: &TcpStream) -> io::Result<Self> {
+        Ok(Self {
+            send_bps: config.up_mbps.saturating_mul(MBPS_TO_BPS),
+            receive_bps: config.down_mbps.saturating_mul(MBPS_TO_BPS),
+            socket: SockRef::from(stream).try_clone()?,
+        })
+    }
+}
 
 /// Check if `addr` is the sing-mux magic address
 pub(super) fn is_mux_address(addr: &Address) -> bool {
@@ -105,11 +141,12 @@ impl SessionRequest {
     }
 }
 
-/// Serve a sing-mux session until it is closed
+/// Serve a sing-mux session until it is closed, TCP Brutal is enabled if `brutal` is set
 pub(super) async fn serve<S>(
     context: Arc<ServiceContext>,
     peer_addr: SocketAddr,
     mut stream: S,
+    brutal: Option<Brutal>,
     timeout: Option<Duration>,
 ) -> io::Result<()>
 where
@@ -130,6 +167,9 @@ where
 
     let stream = PaddingStream::new(stream, request.padding);
 
+    // Stream tasks only hold weak references, so the duplicated socket is closed with the session
+    let brutal = brutal.map(Arc::new);
+
     // Stream tasks are aborted when the session is closed
     let mut streams = JoinSet::new();
 
@@ -139,7 +179,14 @@ where
             let mut session = $session;
             loop {
                 match session.accept().await {
-                    Ok(Some(s)) => spawn_stream(&mut streams, &context, peer_addr, s, timeout),
+                    Ok(Some(s)) => spawn_stream(
+                        &mut streams,
+                        &context,
+                        peer_addr,
+                        s,
+                        brutal.as_ref().map(Arc::downgrade),
+                        timeout,
+                    ),
                     Ok(None) => break Ok(()),
                     Err(err) => break Err(err),
                 }
@@ -168,6 +215,7 @@ fn spawn_stream<T>(
     context: &Arc<ServiceContext>,
     peer_addr: SocketAddr,
     stream: T,
+    brutal: Option<Weak<Brutal>>,
     timeout: Option<Duration>,
 ) where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -175,7 +223,7 @@ fn spawn_stream<T>(
     // Reap finished streams
     while streams.try_join_next().is_some() {}
 
-    streams.spawn(serve_stream(context.clone(), peer_addr, stream, timeout));
+    streams.spawn(serve_stream(context.clone(), peer_addr, stream, brutal, timeout));
 }
 
 /// Stream request
@@ -218,6 +266,13 @@ fn encode_error(message: &str) -> Vec<u8> {
     buf
 }
 
+/// Failure of TCP Brutal bandwidth exchanges, after the success status
+fn encode_brutal_error(message: &str) -> Vec<u8> {
+    let mut buf = vec![STATUS_SUCCESS, 0x00];
+    buf.extend_from_slice(&encode_error(message)[1..]);
+    buf
+}
+
 async fn write_response<S>(stream: &mut S, response: &[u8]) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
@@ -226,8 +281,13 @@ where
     stream.flush().await
 }
 
-async fn serve_stream<T>(context: Arc<ServiceContext>, peer_addr: SocketAddr, mut stream: T, timeout: Option<Duration>)
-where
+async fn serve_stream<T>(
+    context: Arc<ServiceContext>,
+    peer_addr: SocketAddr,
+    mut stream: T,
+    brutal: Option<Weak<Brutal>>,
+    timeout: Option<Duration>,
+) where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // The request is sent with the first payload
@@ -247,7 +307,7 @@ where
     let result = if request.udp {
         serve_udp_stream(&context, peer_addr, &mut stream, &request).await
     } else if matches!(request.destination, Address::DomainNameAddress(ref host, _) if host == BRUTAL_EXCHANGE_DOMAIN) {
-        serve_brutal_exchange(peer_addr, &mut stream, timeout).await
+        serve_brutal_exchange(peer_addr, &mut stream, brutal, timeout).await
     } else {
         serve_tcp_stream(&context, peer_addr, &mut stream, request.destination, timeout).await
     };
@@ -322,19 +382,120 @@ where
     uot::relay(context, peer_addr, stream, connect_addr, MUX_FORMAT).await
 }
 
-/// TCP Brutal is not supported, clients enabling it close the session
-async fn serve_brutal_exchange<T>(peer_addr: SocketAddr, stream: &mut T, timeout: Option<Duration>) -> io::Result<()>
+/// TCP Brutal bandwidth exchange, the sending bandwidth is the smaller one of the server's and the client's receiving.
+///
+/// Clients close the session if it fails.
+async fn serve_brutal_exchange<T>(
+    peer_addr: SocketAddr,
+    stream: &mut T,
+    brutal: Option<Weak<Brutal>>,
+    timeout: Option<Duration>,
+) -> io::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     // Receiving bandwidth of the client
-    timeout_fut(timeout, stream.read_u64()).await?;
+    let client_receive_bps = timeout_fut(timeout, stream.read_u64()).await?;
 
-    debug!(
-        "sing-mux client {} requested TCP Brutal, which is not enabled",
-        peer_addr
-    );
-    write_response(stream, BRUTAL_NOT_ENABLED).await
+    let Some(brutal) = brutal else {
+        debug!(
+            "sing-mux client {} requested TCP Brutal, which is not enabled",
+            peer_addr
+        );
+        return write_response(stream, BRUTAL_NOT_ENABLED).await;
+    };
+
+    let response = {
+        // Fails if the session is closed
+        let brutal = brutal.upgrade().ok_or(io::ErrorKind::BrokenPipe)?;
+        let send_bps = brutal.send_bps.min(client_receive_bps);
+        let receive_bps = brutal.receive_bps;
+        // The kernel may run modprobe synchronously to load the module
+        match task::spawn_blocking(move || set_brutal_options(&brutal.socket, send_bps)).await? {
+            Ok(()) => {
+                debug!(
+                    "sing-mux client {} enabled TCP Brutal, sending {} B/s, receiving {} B/s",
+                    peer_addr, send_bps, receive_bps
+                );
+                let mut buf = vec![STATUS_SUCCESS, 0x01];
+                buf.extend_from_slice(&receive_bps.to_be_bytes());
+                buf
+            }
+            Err(err) => {
+                warn!("sing-mux client {} enable TCP Brutal failed, error: {}", peer_addr, err);
+                encode_brutal_error(&format!("enable TCP Brutal: {err}"))
+            }
+        }
+    };
+    write_response(stream, &response).await
+}
+
+/// Set congestion control of `socket` to TCP Brutal, which requires the tcp-brutal kernel module
+///
+/// <https://github.com/apernet/tcp-brutal>
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_brutal_options(socket: &Socket, send_bps: u64) -> io::Result<()> {
+    use std::{mem, os::fd::AsRawFd};
+
+    const CONGESTION_CONTROL: &[u8] = b"brutal";
+    const TCP_BRUTAL_PARAMS: libc::c_int = 23301;
+
+    #[repr(C)]
+    struct BrutalParams {
+        /// Sending bandwidth in bytes per second
+        rate: u64,
+        /// Congestion window gain in tenths
+        cwnd_gain: u32,
+    }
+
+    let params = BrutalParams {
+        rate: send_bps,
+        // Default of hysteria2 and sing-mux
+        cwnd_gain: 20,
+    };
+
+    let fd = socket.as_raw_fd();
+    unsafe {
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            CONGESTION_CONTROL.as_ptr() as *const _,
+            CONGESTION_CONTROL.len() as libc::socklen_t,
+        );
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                err.kind(),
+                format!("setsockopt TCP_CONGESTION brutal: {err}"),
+            ));
+        }
+
+        let ret = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_BRUTAL_PARAMS,
+            &params as *const _ as *const _,
+            mem::size_of_val(&params) as libc::socklen_t,
+        );
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                err.kind(),
+                format!("setsockopt TCP_BRUTAL_PARAMS: {err}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_brutal_options(_: &Socket, _: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "TCP Brutal is only supported on Linux",
+    ))
 }
 
 #[cfg(test)]
@@ -399,7 +560,7 @@ mod test {
         let (mut client, server) = tokio::io::duplex(1024 * 1024);
         client.write_all(header).await.unwrap();
         let peer_addr = "127.0.0.1:1".parse().unwrap();
-        tokio::spawn(serve(Arc::new(context), peer_addr, server, None));
+        tokio::spawn(serve(Arc::new(context), peer_addr, server, None, None));
         client
     }
 
@@ -601,6 +762,10 @@ mod test {
             &BRUTAL_NOT_ENABLED[2..],
             &encode_error("brutal is not enabled by the server")[1..]
         );
+        assert_eq!(
+            encode_brutal_error("brutal is not enabled by the server"),
+            BRUTAL_NOT_ENABLED
+        );
     }
 
     #[tokio::test]
@@ -701,6 +866,71 @@ mod test {
             .unwrap()
             .unwrap();
         assert_eq!(response, BRUTAL_NOT_ENABLED);
+    }
+
+    /// The session's socket is enabled TCP Brutal if the tcp-brutal kernel module is available
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn brutal_exchange() {
+        use std::os::fd::AsRawFd;
+        use tokio::net::TcpStream;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let config = MultiplexBrutalConfig {
+            up_mbps: 100,
+            down_mbps: 200,
+        };
+        let brutal = Brutal::new(config, &socket).unwrap();
+
+        let (mut client, server) = tokio::io::duplex(1024 * 1024);
+        client.write_all(&[0x00, PROTOCOL_YAMUX]).await.unwrap();
+        let peer_addr = "127.0.0.1:1".parse().unwrap();
+        tokio::spawn(serve(
+            Arc::new(ServiceContext::new()),
+            peer_addr,
+            server,
+            Some(brutal),
+            None,
+        ));
+        let mut control = yamux_client(client).await;
+
+        let mut stream = control.open_stream().await.unwrap();
+        let mut data = stream_request(0, &Address::DomainNameAddress(BRUTAL_EXCHANGE_DOMAIN.to_owned(), 0));
+        data.extend_from_slice(&1_000_000_000u64.to_be_bytes());
+        stream.write_all(&data).await.unwrap();
+        let mut response = Vec::new();
+        time::timeout(TIMEOUT, stream.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response[0], STATUS_SUCCESS);
+        if response[1] == 0x01 {
+            assert_eq!(response[2..], (200 * MBPS_TO_BPS).to_be_bytes());
+            let mut name = [0u8; 16];
+            let mut len = name.len() as libc::socklen_t;
+            let ret = unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_CONGESTION,
+                    name.as_mut_ptr() as *mut _,
+                    &mut len,
+                )
+            };
+            assert_eq!(ret, 0);
+            assert!(name.starts_with(b"brutal\0"), "{name:?}");
+        } else {
+            // The kernel module is not available, the parameters must not fail
+            let message = String::from_utf8(response[3..].to_vec()).unwrap();
+            assert_eq!(response[1..3], [0x00, message.len() as u8]);
+            assert!(
+                message.starts_with("enable TCP Brutal: setsockopt TCP_CONGESTION brutal: "),
+                "{message}"
+            );
+        }
     }
 
     #[tokio::test]

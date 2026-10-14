@@ -15,7 +15,7 @@ use tokio::time;
 
 use crate::{
     acl::AccessControl,
-    config::{DomainSniffConfig, OutboundProxy, SecurityConfig},
+    config::{DomainSniffConfig, MultiplexBrutalConfig, OutboundProxy, SecurityConfig},
     net::{FlowStat, jls::is_jls_plugin},
     utils::ServerHandle,
 };
@@ -126,6 +126,11 @@ impl ServerBuilder {
     /// Set sing-box multiplex
     pub fn set_multiplex(&mut self, multiplex: bool) {
         self.context.set_multiplex(multiplex);
+    }
+
+    /// Set TCP Brutal of sing-box multiplex
+    pub fn set_multiplex_brutal(&mut self, brutal: Option<MultiplexBrutalConfig>) {
+        self.context.set_multiplex_brutal(brutal);
     }
 
     /// Start the server
